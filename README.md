@@ -66,31 +66,31 @@ A modern, AI-powered learning platform that provides personalized learning exper
 ### Installation
 
 1. Clone the repository:
-\`\`\`bash
-git clone https://github.com/yourusername/learning-platform-next.git
+```bash
+git clone https://github.com/joseluissaorin/learning-platform-next.git
 cd learning-platform-next
-\`\`\`
+```
 
 2. Install dependencies:
-\`\`\`bash
+```bash
 npm install
-\`\`\`
+```
 
 3. Set up environment variables:
-\`\`\`bash
+```bash
 cp .env.example .env
-\`\`\`
+```
 Edit .env with your configuration values.
 
 4. Run database migrations:
-\`\`\`bash
+```bash
 npx prisma migrate dev
-\`\`\`
+```
 
 5. Start the development server:
-\`\`\`bash
+```bash
 npm run dev
-\`\`\`
+```
 
 ## Usage
 
