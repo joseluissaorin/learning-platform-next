@@ -1,116 +1,118 @@
 import { cn } from "@/lib/utils";
-import { Loader2 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { RefreshCw, BookOpen, Layers, Brain, Sparkles } from "lucide-react";
+import { motion } from "framer-motion";
+
+export type LoadingStateType = 
+  | 'summarizing' 
+  | 'analyzing' 
+  | 'generating' 
+  | 'regenerating'
+  | 'processing'
+  | 'thinking';
 
 interface LoadingStateProps {
-  state: 'loading' | 'generating' | 'summarizing' | 'analyzing' | 'regenerating';
+  state: LoadingStateType;
   layer?: number;
   progress?: number;
   className?: string;
+  message?: string;
 }
 
-const messages = {
-  loading: "Loading your learning content...",
-  generating: "Generating explanation...",
+const loadingMessages = {
   summarizing: "Creating a concise summary...",
-  analyzing: "Analyzing content structure...",
-  regenerating: "Regenerating explanation..."
+  analyzing: "Analyzing content in depth...",
+  generating: "Generating detailed explanation...",
+  regenerating: "Regenerating explanations...",
+  processing: "Processing your request...",
+  thinking: "Thinking about your question..."
 };
 
-const details = {
-  loading: "We're preparing your learning materials",
-  generating: "Our AI is crafting a detailed explanation",
-  summarizing: "Distilling the key concepts into a clear summary",
-  analyzing: "Understanding the content structure and relationships",
-  regenerating: "Creating a fresh perspective on this concept"
+const loadingIcons = {
+  summarizing: BookOpen,
+  analyzing: Brain,
+  generating: Sparkles,
+  regenerating: RefreshCw,
+  processing: Layers,
+  thinking: Brain
 };
 
-const spinTransition = {
-  loop: Infinity,
-  ease: "linear",
-  duration: 1
-};
+export function LoadingState({ 
+  state, 
+  layer, 
+  progress, 
+  className,
+  message 
+}: LoadingStateProps) {
+  const Icon = loadingIcons[state];
+  const defaultMessage = loadingMessages[state];
 
-export function LoadingState({ state, layer, progress, className }: LoadingStateProps) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -20 }}
-      transition={{ duration: 0.3 }}
-      className={cn(
-        "flex flex-col items-center justify-center min-h-[300px] space-y-6 text-center px-4",
-        className
-      )}
-    >
-      <div className="relative">
-        <motion.div
-          animate={{ rotate: 360 }}
-          transition={spinTransition}
-        >
-          <Loader2 className="h-12 w-12 text-primary" />
-        </motion.div>
-        <AnimatePresence mode="wait">
-          {progress !== undefined && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
-              transition={{ duration: 0.2 }}
-              className="absolute inset-0 flex items-center justify-center"
-            >
-              <span className="text-xs font-medium">{Math.round(progress)}%</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
+    <div className={cn(
+      "flex flex-col items-center justify-center h-full space-y-6",
+      className
+    )}>
       <motion.div
-        layout
-        className="space-y-2 max-w-md"
+        animate={{
+          rotate: state === 'regenerating' ? 360 : 0,
+          scale: [1, 1.1, 1]
+        }}
+        transition={{
+          rotate: {
+            duration: 2,
+            repeat: Infinity,
+            ease: "linear"
+          },
+          scale: {
+            duration: 2,
+            repeat: Infinity,
+            ease: "easeInOut"
+          }
+        }}
+        className="relative"
       >
-        <motion.h3
-          key={state}
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          exit={{ opacity: 0, x: 20 }}
-          transition={{ duration: 0.3 }}
-          className="text-lg font-semibold text-foreground"
-        >
-          {messages[state]}
-        </motion.h3>
-        <motion.p
-          key={`${state}-${layer}`}
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          exit={{ opacity: 0, x: 20 }}
-          transition={{ duration: 0.3, delay: 0.1 }}
-          className="text-sm text-muted-foreground"
-        >
-          {details[state]}
-          {layer && state !== 'loading' && (
-            <motion.span
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.3, delay: 0.2 }}
-            > for Layer {layer}</motion.span>
-          )}
-        </motion.p>
+        <Icon className="h-12 w-12 text-primary" />
+        {state === 'regenerating' && (
+          <motion.div
+            className="absolute inset-0 border-2 border-primary rounded-full"
+            animate={{
+              scale: [1, 1.5, 1],
+              opacity: [1, 0, 1]
+            }}
+            transition={{
+              duration: 2,
+              repeat: Infinity,
+              ease: "easeInOut"
+            }}
+          />
+        )}
       </motion.div>
 
-      <AnimatePresence>
-        {state === 'generating' && (
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={{ duration: 0.3 }}
-            className="text-xs text-muted-foreground/60 max-w-xs"
-          >
-            This usually takes a few seconds. We're making sure the explanation is thorough and easy to understand.
-          </motion.div>
+      <div className="space-y-3 text-center">
+        <p className="text-lg font-medium text-foreground">
+          {message || defaultMessage}
+        </p>
+        {layer && (
+          <p className="text-sm text-muted-foreground">
+            Layer {layer} {state === 'regenerating' ? 'regeneration' : 'generation'}
+          </p>
         )}
-      </AnimatePresence>
-    </motion.div>
+      </div>
+
+      {progress !== undefined && (
+        <div className="w-64 space-y-2">
+          <div className="h-2 bg-muted rounded-full overflow-hidden">
+            <motion.div 
+              className="h-full bg-primary"
+              initial={{ width: 0 }}
+              animate={{ width: `${progress}%` }}
+              transition={{ duration: 0.5 }}
+            />
+          </div>
+          <p className="text-sm text-muted-foreground text-center">
+            {Math.round(progress)}% complete
+          </p>
+        </div>
+      )}
+    </div>
   );
 } 

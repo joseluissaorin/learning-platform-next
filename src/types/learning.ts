@@ -13,6 +13,7 @@ export type LearningSession = {
     id: string;
     title: string;
     content: string;
+    structuredContent?: string | Record<string, any>;
     metadata?: Record<string, any>;
   };
 };
@@ -60,6 +61,8 @@ export interface Section {
   title: string;
   content?: string;
   subsections?: Section[];
+  order?: string;
+  id?: string;
 }
 
 export interface Index {

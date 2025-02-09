@@ -103,3 +103,13 @@ changelog.md
 codebase-knowledge.md
 technical-specs/**
 technical-specs/
+
+*.py
+
+old_changelog.md
+old_codebase-knowledge.md
+
+CHANGELOG.md
+CODEBASE-KNOWLEDGE.md
+migration.sql
+new_summarize.py

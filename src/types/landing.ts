@@ -34,7 +34,7 @@ export interface Testimonial {
 // FAQ Types
 export interface FAQItem {
   question: string;
-  answer: string;
+  answer: string | React.ReactNode;
 }
 
 // Component Props

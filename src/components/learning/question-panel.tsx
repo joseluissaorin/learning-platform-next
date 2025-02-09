@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Send, Loader2, Trash2 } from "lucide-react";
-import { type Concept, type Message } from "@/types/learning";
+import { type Concept, type Message, type LearningSession } from "@/types/learning";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from 'react-markdown';
 import { messageCacheService } from "@/lib/cache/message-cache";
@@ -20,14 +20,17 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { v4 as uuidv4 } from 'uuid';
+import gemini from "@/lib/gemini";
 
 interface QuestionPanelProps {
   explanationId: string;
   concept: Concept;
   explanation?: string | null;
+  session: LearningSession;
 }
 
-export function QuestionPanel({ explanationId, concept, explanation }: QuestionPanelProps) {
+export function QuestionPanel({ explanationId, concept, explanation, session }: QuestionPanelProps) {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -62,76 +65,102 @@ export function QuestionPanel({ explanationId, concept, explanation }: QuestionP
     updateCache();
   }, [messages, explanationId, isLoading]);
 
+  const buildContext = (question: string) => {
+    // Build a comprehensive context including the full document structure
+    const conceptContext = session.concepts
+      .map(c => `${c.title}:\n${c.content}`)
+      .join('\n\n');
+
+    return `
+      You are a helpful AI tutor assisting with questions about concepts in this learning session.
+      
+      # Session Overview
+      Title: ${session.title}
+      
+      # Full Document Structure
+      ${conceptContext}
+      
+      # Current Concept
+      Title: ${concept.title}
+      Content: ${explanation || concept.content}
+      
+      # Instructions
+      1. You are currently focused on explaining "${concept.title}", but you have access to the full document context above.
+      2. Use the full context to provide comprehensive answers that show how this concept relates to others.
+      3. If the question relates to other concepts, mention those relationships explicitly.
+      4. Use markdown formatting for better readability.
+      5. Answer in the language of the question.
+      6. Prioritize accuracy and clarity in your explanations.
+      7. If relevant, explain how this concept builds upon or leads to other concepts in the session.
+      
+      # Student's Question: ${question}
+    `;
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!question.trim() || isSubmitting) return;
+    if (!question.trim() || isLoading) return;
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
+    const newMessage: Message = {
+      id: uuidv4(),
       role: 'user',
       content: question,
-      timestamp: new Date(),
+      timestamp: new Date()
     };
 
-    setMessages(prev => [...prev, userMessage]);
-    setQuestion("");
+    setMessages(prev => [...prev, newMessage]);
+    setQuestion('');
     setIsSubmitting(true);
 
     try {
-      console.log('Debug - Submitting question with data:', {
-        question,
-        conceptId: concept.id,
-        explanationId,
-        hasExplanation: !!explanation,
-        explanationLength: explanation?.length || 0
-      });
-
-      if (!explanation) {
-        console.error('Debug - Missing explanation content');
-        throw new Error('Explanation content is missing');
+      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error('GEMINI_API_KEY is not configured');
       }
 
-      const response = await fetch('/api/concepts/question', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          question,
-          conceptId: concept.id,
-          explanationId,
-          context: explanation,
-        }),
+      const model = gemini.getGenerativeModel({ 
+        model: 'gemini-pro'
       });
+      model.apiKey = apiKey;
 
-      console.log('Debug - API Response status:', response.status);
+      // Use the enhanced context builder
+      const context = buildContext(question);
 
-      if (!response.ok) {
-        throw new Error('Failed to get answer');
-      }
-
-      const data = await response.json();
-      console.log('Debug - API Response data received');
+      const result = await model.generateContent(context);
+      const response = await result.response;
+      const answer = response.text();
 
       const assistantMessage: Message = {
-        id: Date.now().toString(),
+        id: uuidv4(),
         role: 'assistant',
-        content: data.answer,
-        timestamp: new Date(),
+        content: answer,
+        timestamp: new Date()
       };
 
       setMessages(prev => [...prev, assistantMessage]);
+
+      if (typeof window !== 'undefined') {
+        await messageCacheService.setMessages(explanationId, [
+          ...messages,
+          newMessage,
+          assistantMessage
+        ]);
+      }
     } catch (error) {
-      console.error('Debug - Error details:', error);
-      const errorMessage: Message = {
-        id: Date.now().toString(),
-        role: 'assistant',
-        content: 'Sorry, I encountered an error while processing your question. Please try again.',
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, errorMessage]);
+      console.error('Error generating response:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to generate response';
+      setMessages(prev => [
+        ...prev,
+        {
+          id: uuidv4(),
+          role: 'assistant',
+          content: `I apologize, but I encountered an error: ${errorMessage}. Please try again.`,
+          timestamp: new Date()
+        }
+      ]);
     } finally {
       setIsSubmitting(false);
+      setIsLoading(false);
     }
   };
 
@@ -236,24 +265,24 @@ export function QuestionPanel({ explanationId, concept, explanation }: QuestionP
         <div className="p-4 border-t border-border">
           <form onSubmit={handleSubmit} className="flex gap-2">
             <Input
+              type="text"
+              placeholder="Ask a question..."
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
-              placeholder="Ask a question..."
               disabled={isSubmitting || isLoading}
-              className="flex-1 bg-background border border-border focus-visible:ring-0 focus-visible:ring-offset-0 placeholder:text-muted-foreground"
+              className="flex-1"
             />
             <Button 
               type="submit" 
-              size="icon"
-              variant="ghost"
-              disabled={isSubmitting || isLoading}
-              className="h-10 w-10 transition-all duration-200 hover:scale-105"
+              disabled={isSubmitting || isLoading || !question.trim()}
+              className="shrink-0"
             >
               {isSubmitting ? (
-                <Loader2 className="h-5 w-5 animate-spin" />
+                <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
-                <Send className="h-5 w-5" />
+                <Send className="h-4 w-4" />
               )}
+              <span className="sr-only">Send message</span>
             </Button>
           </form>
         </div>

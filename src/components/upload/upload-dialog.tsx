@@ -280,7 +280,7 @@ export function UploadDialog({ trigger, onComplete }: UploadDialogProps) {
             withCredentials: true
           });
 
-          let hasCompleted = false;
+          const hasCompleted = false;
 
           // Handle progress updates
           console.log("[Analysis] Adding progress event listener");

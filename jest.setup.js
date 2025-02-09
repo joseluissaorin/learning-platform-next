@@ -21,4 +21,25 @@ jest.mock('fs', () => ({
 // Mock path module
 jest.mock('path', () => ({
   join: jest.fn().mockReturnValue('/mocked/path/to/prompt.md'),
-})); 
+}));
+
+// Mock next/navigation
+jest.mock('next/navigation', () => ({
+  useRouter() {
+    return {
+      push: jest.fn(),
+      replace: jest.fn(),
+      prefetch: jest.fn(),
+    };
+  },
+  useSearchParams() {
+    return {
+      get: jest.fn(),
+    };
+  },
+}));
+
+// Reset all mocks after each test
+afterEach(() => {
+  jest.clearAllMocks();
+}); 

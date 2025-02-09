@@ -1,504 +1,276 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+// useConceptNavigation.ts
+
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { type LearningSession } from '@/types/learning';
 import { type ConceptIndex } from '@/types/analysis';
 import { explanationCacheService } from '@/lib/cache/explanation-cache';
 import { logger } from '@/lib/debug/logger';
-import { conceptNavigationDebugger } from '@/lib/debug/concept-navigation-debug';
-import { nestConcepts, flattenConcepts } from '@/lib/utils/concept-transformer';
+import { nestConcepts } from '@/lib/utils/concept-transformer';
 
-// Represents the entire navigation state
-interface ConceptState {
-  currentIndex: number;
-  currentLayer: number;
-  currentPath: string[];
+/**
+ * The primary state interface for ALNS navigation.
+ */
+interface ALNState {
+  // The concept that is currently "selected" by the learner
+  currentConceptId: string | null;
+  // Explanation for the current concept
   explanation: string | null;
+  // Are we fetching the explanation from the server?
   isLoading: boolean;
+  // Error while fetching explanation (if any)
   error: string | null;
+  // Linear progress for the "visible" array (see getVisibleConcepts)
   progress: number;
-  totalConceptsInLayer: number;
-  completedConceptsInLayer: number;
+  // Count of visible concepts
+  totalVisible: number;
+  // Index of current concept in the visible list
+  visibleIndex: number;
+  // Additional signals (regeneration, etc.)
   regenerationProgress: {
     isRegenerating: boolean;
-    completedLayers: number;
-    totalLayers: number;
-  };
-  toast: {
-    type: 'success' | 'error' | 'info' | null;
-    message: string | null;
+    progress: number;
   };
 }
 
-export interface ConceptNavigation {
-  state: ConceptState;
+/**
+ * The exported interface for ALNS-based concept navigation.
+ */
+export interface ALNSNavigation {
+  state: ALNState;
   nextConcept: () => void;
   previousConcept: () => void;
-  changeLayer: (layer: number) => void;
   regenerateExplanation: () => Promise<void>;
+  getVisibleConcepts: () => ConceptIndex[];
   getCurrentConcept: () => ConceptIndex | null;
-  getLayerConcepts: () => ConceptIndex[];
 }
 
-export function useConceptNavigation(session: LearningSession): ConceptNavigation {
-  // Transform concepts to nested structure on initialization
-  const nestedConcepts = useRef<ConceptIndex[]>(nestConcepts(session.concepts));
+/**
+ * ALNS Hook Implementation
+ */
+export function useConceptNavigation(session: LearningSession): ALNSNavigation {
+  // Build a nested concept tree from the session's concepts
+  const nestedConcepts = useMemo(() => nestConcepts(session.concepts), [session.concepts]);
 
-  // -------------------------------------------------------------------------------------------
-  // 1) State Management
-  // -------------------------------------------------------------------------------------------
-  const [state, setState] = useState<ConceptState>({
-    currentIndex: 0,
-    currentLayer: 1,
-    currentPath: [],
+  // Flatten all concepts for easy access
+  const flatConcepts = useMemo<ConceptIndex[]>(() => {
+    const result: ConceptIndex[] = [];
+    const traverse = (c: ConceptIndex) => {
+      result.push(c);
+      if (c.children) {
+        c.children.forEach(traverse);
+      }
+    };
+    nestedConcepts.forEach(traverse);
+    return result;
+  }, [nestedConcepts]);
+
+  // The main state - simplified to remove layer management
+  const [state, setState] = useState<ALNState>(() => ({
+    currentConceptId: flatConcepts[0]?.id || null,
     explanation: null,
     isLoading: false,
     error: null,
     progress: 0,
-    totalConceptsInLayer: 0,
-    completedConceptsInLayer: 0,
+    totalVisible: flatConcepts.length,
+    visibleIndex: 0,
     regenerationProgress: {
       isRegenerating: false,
-      completedLayers: 0,
-      totalLayers: 3
+      progress: 0
+    }
+  }));
+
+  // We store a set of "currently generating" keys to avoid duplication
+  const generatingSetRef = useRef<Set<string>>(new Set());
+
+  /**
+   * getVisibleConcepts
+   * Return all concepts in their natural order
+   */
+  const getVisibleConcepts = useCallback((): ConceptIndex[] => {
+    return flatConcepts;
+  }, [flatConcepts]);
+
+  /**
+   * getCurrentConcept
+   */
+  const getCurrentConcept = useCallback((): ConceptIndex | null => {
+    if (!state.currentConceptId) return null;
+    return flatConcepts.find((c) => c.id === state.currentConceptId) || null;
+  }, [state.currentConceptId, flatConcepts]);
+
+  /**
+   * fetchExplanation
+   * Fetch the explanation for the currently selected concept
+   */
+  const fetchExplanation = async (params: {
+    conceptId: string;
+    conceptPath?: string[];
+    forceRegenerate?: boolean;
+  }) => {
+    const searchParams = new URLSearchParams({
+      conceptId: params.conceptId,
+      layer: '3', // Always use layer 3
+      ...(params.forceRegenerate && { forceRegenerate: 'true' }),
+      ...(params.conceptPath && { conceptPath: params.conceptPath.join(',') }),
+    });
+
+    const response = await fetch(`/api/explanations?${searchParams}`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch explanation');
+    }
+    const data = await response.json();
+    return data.explanation;
+  };
+
+  /**
+   * buildConceptPath
+   * Reconstruct the chain of titles from root -> concept
+   */
+  const buildConceptPath = useCallback(
+    (conceptId: string): string[] => {
+      const path: string[] = [];
+      let current: ConceptIndex | undefined = flatConcepts.find(c => c.id === conceptId);
+      
+      while (current !== undefined) {
+        path.unshift(current.title);
+        current = current.parentId 
+          ? flatConcepts.find(c => c.id === current?.parentId)
+          : undefined;
+      }
+      
+      return path;
     },
-    toast: {
-      type: null,
-      message: null
-    }
-  });
+    [flatConcepts]
+  );
 
-  // Refs used for controlling explanation fetch concurrency
-  const generatingConceptsRef = useRef<Set<string>>(new Set());
-  const currentConceptRef = useRef<string>('');
-  const lastFetchedKeyRef = useRef<string | null>(null);
-
-  // -------------------------------------------------------------------------------------------
-  // 2) Build a flat list of all concepts by traversing the tree
-  // -------------------------------------------------------------------------------------------
-  const flatConcepts = useCallback((): ConceptIndex[] => {
-    return flattenConcepts(nestedConcepts.current);
-  }, []);
-
-  // -------------------------------------------------------------------------------------------
-  // 3) Return the concepts actually visible at the current layer
-  // -------------------------------------------------------------------------------------------
-  const getLayerConcepts = useCallback((): ConceptIndex[] => {
-    const allConcepts = flatConcepts();
-    const currentConcept = allConcepts[state.currentIndex];
-
-    logger.debug('getLayerConcepts', 'Starting concept filtering', {
-      currentLayer: state.currentLayer,
-      currentConceptId: currentConcept?.id,
-      currentConceptTitle: currentConcept?.title,
-      currentConceptContent: currentConcept?.content?.substring(0, 100) + '...',
-      hasChildren: currentConcept?.children?.length ?? 0
-    });
-
-    // Filter concepts based on their level from the database
-    const layerConcepts = allConcepts.filter(concept => {
-      if (state.currentLayer === 1) {
-        return concept.level === 0; // Root concepts
-      } else if (state.currentLayer === 2) {
-        if (!currentConcept) return false;
-        const mainConceptId = currentConcept.id.split('.')[0];
-        return concept.level === 1 && concept.parentId?.startsWith(mainConceptId);
-      } else if (state.currentLayer === 3) {
-        if (!currentConcept) return false;
-        const parentId = currentConcept.id.split('.').slice(0, 2).join('.');
-        return concept.level === 2 && concept.parentId === parentId;
-      }
-      return false;
-    });
-
-    // Sort concepts by their order field
-    return layerConcepts.sort((a, b) => (a.order || 0) - (b.order || 0));
-  }, [state.currentLayer, state.currentIndex, flatConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 4) Fetch Explanation for current concept + layer (uses caching).
-  // -------------------------------------------------------------------------------------------
-  const fetchExplanation = useCallback(async (conceptId: string, layer: number) => {
-    logger.debug('fetchExplanation Start', JSON.stringify({
-      conceptId,
-      layer,
-      currentKey: `${conceptId}-${layer}`,
-      isGenerating: generatingConceptsRef.current.has(`${conceptId}-${layer}`),
-      lastFetchedKey: lastFetchedKeyRef.current
-    }));
-
-    // Ensure concept is valid for the current layer
-    const layerConcepts = getLayerConcepts();
-    const isValidLayerConcept = layerConcepts.some(c => c.id === conceptId);
-    
-    logger.debug('Concept Validation', JSON.stringify({
-      conceptId,
-      isValid: isValidLayerConcept,
-      availableConcepts: layerConcepts.map(c => ({
-        id: c.id,
-        title: c.title,
-        level: c.level,
-        order: c.order
-      }))
-    }));
-
-    if (!isValidLayerConcept) {
-      logger.warn('Invalid Concept for Layer', JSON.stringify({
-        conceptId,
-        layer,
-        availableIds: layerConcepts.map(c => c.id)
-      }));
-      return;
-    }
-
-    logger.info('useConceptNavigation', 'Fetching explanation', { conceptId, layer });
-    setState(prev => ({ ...prev, isLoading: true, error: null }));
-    generatingConceptsRef.current.add(`${conceptId}-${layer}`);
-    currentConceptRef.current = conceptId;
-
-    try {
-      // Check cache
-      const cached = await explanationCacheService.getExplanation(conceptId, layer);
-      logger.debug('Cache Check Result', JSON.stringify({
-        conceptId,
-        layer,
-        hasCachedValue: !!cached,
-        cacheLength: cached?.length ?? 0
-      }));
-
-      if (cached && currentConceptRef.current === conceptId) {
-        logger.debug('useConceptNavigation', 'Using cached explanation', { conceptId, layer });
-        setState(prev => ({ ...prev, explanation: cached, isLoading: false }));
-        return;
-      }
-
-      // Build request
-      const concepts = flatConcepts();
-      const currentConcept = concepts.find(c => c.id === conceptId);
-      const isLeafNode = !currentConcept?.children?.length;
-      const parentTitles: string[] = [];
-
-      // Get parent titles from the concept hierarchy
-      if (currentConcept?.parentId) {
-        const parentConcept = concepts.find(c => c.id === currentConcept.parentId);
-        if (parentConcept) {
-          parentTitles.push(parentConcept.title);
-          if (parentConcept.parentId) {
-            const grandParentConcept = concepts.find(c => c.id === parentConcept.parentId);
-            if (grandParentConcept) {
-              parentTitles.unshift(grandParentConcept.title);
-            }
-          }
-        }
-      }
-
-      // Call the API
-      const requestBody = {
-        conceptId,
-        layer,
-        conceptTitle: currentConcept?.title,
-        documentContent: session.document?.content,
-        sessionId: session.id,
-        parentTitles,
-        isLeafNode
-      };
-
-      logger.info('useConceptNavigation', 'Sending explanation request', {
-        conceptId,
-        layer,
-        conceptTitle: currentConcept?.title,
-        sessionId: session.id,
-        parentTitles,
-        isLeafNode,
-        documentContentLength: session.document?.content?.length ?? 0
-      });
-
-      const response = await fetch('/api/concepts/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
-        credentials: 'include'
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || 'Failed to fetch explanation');
-      }
-
-      const data = await response.json();
-      await explanationCacheService.setExplanation(conceptId, layer, data.content);
-
-      if (currentConceptRef.current === conceptId) {
-        setState(prev => ({
-          ...prev,
-          explanation: data.content,
-          isLoading: false
-        }));
-      }
-    } catch (error) {
-      logger.error('Explanation Fetch Failed', JSON.stringify({
-        conceptId,
-        layer,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        state: {
-          currentIndex: state.currentIndex,
-          currentLayer: state.currentLayer,
-          isLoading: state.isLoading
-        }
-      }));
-      if (currentConceptRef.current === conceptId) {
-        setState(prev => ({
-          ...prev,
-          error: error instanceof Error ? error.message : 'Failed to fetch explanation',
-          isLoading: false
-        }));
-      }
-    } finally {
-      generatingConceptsRef.current.delete(`${conceptId}-${layer}`);
-      lastFetchedKeyRef.current = `${conceptId}-${layer}`;
-    }
-  }, [session, flatConcepts, getLayerConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 5) nextConcept / previousConcept: step through the concepts of the current layer
-  // -------------------------------------------------------------------------------------------
+  /**
+   * Navigation functions
+   */
   const nextConcept = useCallback(() => {
-    const layerConcepts = getLayerConcepts();
-    const all = flatConcepts();
-    const currentC = all[state.currentIndex];
-
-    logger.debug('useConceptNavigation', 'Next concept triggered', {
-      currentId: currentC?.id,
-      layerConceptsCount: layerConcepts.length,
-      currentLayer: state.currentLayer
+    setState(prev => {
+      const visibleConcepts = flatConcepts;
+      const currentIndex = visibleConcepts.findIndex(c => c.id === prev.currentConceptId);
+      const nextIndex = currentIndex + 1;
+      
+      if (nextIndex >= visibleConcepts.length) return prev;
+      
+      return {
+        ...prev,
+        currentConceptId: visibleConcepts[nextIndex].id,
+        visibleIndex: nextIndex,
+        progress: (nextIndex / (visibleConcepts.length - 1)) * 100
+      };
     });
-
-    const iInLayer = layerConcepts.findIndex(c => c.id === currentC?.id);
-    if (iInLayer < layerConcepts.length - 1) {
-      const nextC = layerConcepts[iInLayer + 1];
-      const nextIndex = all.findIndex(c => c.id === nextC.id);
-
-      logger.debug('useConceptNavigation', 'Moving to next concept', {
-        from: currentC?.id,
-        to: nextC.id,
-        fromIndex: state.currentIndex,
-        toIndex: nextIndex
-      });
-
-      if (nextIndex !== -1) {
-        setState(prev => ({ ...prev, currentIndex: nextIndex, explanation: null, error: null }));
-      }
-    }
-  }, [state.currentIndex, state.currentLayer, getLayerConcepts, flatConcepts]);
+  }, [flatConcepts]);
 
   const previousConcept = useCallback(() => {
-    const layerConcepts = getLayerConcepts();
-    const all = flatConcepts();
-    const currentC = all[state.currentIndex];
-
-    logger.debug('useConceptNavigation', 'Previous concept triggered', {
-      currentId: currentC?.id,
-      layerConceptsCount: layerConcepts.length,
-      currentLayer: state.currentLayer
-    });
-
-    const iInLayer = layerConcepts.findIndex(c => c.id === currentC?.id);
-    if (iInLayer > 0) {
-      const prevC = layerConcepts[iInLayer - 1];
-      const prevIndex = all.findIndex(c => c.id === prevC.id);
-
-      logger.debug('useConceptNavigation', 'Moving to previous concept', {
-        from: currentC?.id,
-        to: prevC.id,
-        fromIndex: state.currentIndex,
-        toIndex: prevIndex
-      });
-
-      if (prevIndex !== -1) {
-        setState(prev => ({ ...prev, currentIndex: prevIndex, explanation: null, error: null }));
-      }
-    }
-  }, [state.currentIndex, state.currentLayer, getLayerConcepts, flatConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 6) changeLayer: carefully reset index, explanation, and fetch new data
-  // -------------------------------------------------------------------------------------------
-  const changeLayer = useCallback((newLayer: number) => {
-    logger.info('Layer Change Started', JSON.stringify({
-      from: state.currentLayer,
-      to: newLayer,
-      currentConceptId: flatConcepts()[state.currentIndex]?.id,
-      currentConceptTitle: flatConcepts()[state.currentIndex]?.title
-    }));
-
-    // Temporarily set loading & clear explanation
-    setState(prev => ({
-      ...prev,
-      isLoading: true,
-      explanation: null,
-      error: null
-    }));
-
-    conceptNavigationDebugger.logLayerTransition(state.currentLayer, newLayer, state.currentIndex);
-
-    // Figure out the new concept set for that layer
-    // We'll do this AFTER we set the new layer in state, then pick index 0 by default.
-    // But first, let's set the layer so getLayerConcepts will re-run for the new layer:
-    setState(prev => ({ ...prev, currentLayer: newLayer }));
-
-    // In the same tick, let's see which concepts are valid for the new layer
-    // We do this in a small callback on the next tick so setState for currentLayer is done:
-    setTimeout(() => {
-      const layerConcepts = getLayerConcepts();
-
-      // Use first concept if available, else remain on 0
-      let newIndex = 0;
-      if (layerConcepts.length > 0) {
-        // If the old concept is itself valid for the new layer, keep it. Otherwise set 0.
-        const oldConcept = flatConcepts()[state.currentIndex];
-        const stillValid = layerConcepts.some(c => c.id === oldConcept?.id);
-        if (stillValid) {
-          newIndex = flatConcepts().findIndex(c => c.id === oldConcept?.id);
-        }
-      }
-
-      logger.debug('useConceptNavigation', 'changeLayer post-check', {
-        layerConceptCount: layerConcepts.length,
-        chosenIndex: newIndex
-      });
-
-      setState(prev => ({
+    setState(prev => {
+      const visibleConcepts = flatConcepts;
+      const currentIndex = visibleConcepts.findIndex(c => c.id === prev.currentConceptId);
+      const prevIndex = currentIndex - 1;
+      
+      if (prevIndex < 0) return prev;
+      
+      return {
         ...prev,
-        currentIndex: newIndex,
-        totalConceptsInLayer: layerConcepts.length,
-        completedConceptsInLayer: layerConcepts.length > 0 ? 1 : 0,
-        progress: layerConcepts.length > 0 ? (1 / layerConcepts.length) * 100 : 0,
-        isLoading: false
-      }));
-
-      lastFetchedKeyRef.current = null; // force re-fetch
-    }, 0);
-  }, [state.currentLayer, state.currentIndex, flatConcepts, getLayerConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 7) Regenerate Explanation
-  // -------------------------------------------------------------------------------------------
-  const regenerateExplanation = useCallback(async () => {
-    const all = flatConcepts();
-    const curr = all[state.currentIndex];
-    if (!curr || state.isLoading) {
-      logger.warn('useConceptNavigation', 'Cannot regenerate explanation', {
-        reason: !curr ? 'no current concept' : 'already loading',
-        currentIndex: state.currentIndex
-      });
-      return;
-    }
-
-    logger.info('useConceptNavigation', 'Starting explanation regeneration', {
-      conceptId: curr.id,
-      layer: state.currentLayer
+        currentConceptId: visibleConcepts[prevIndex].id,
+        visibleIndex: prevIndex,
+        progress: (prevIndex / (visibleConcepts.length - 1)) * 100
+      };
     });
+  }, [flatConcepts]);
+
+  /**
+   * Regenerate explanation for current concept
+   */
+  const regenerateExplanation = useCallback(async () => {
+    const currentConcept = getCurrentConcept();
+    if (!currentConcept || generatingSetRef.current.has(currentConcept.id)) return;
 
     setState(prev => ({
       ...prev,
       isLoading: true,
       error: null,
-      explanation: null
+      regenerationProgress: {
+        isRegenerating: true,
+        progress: 0
+      }
     }));
 
     try {
-      // Clear cached explanation for this concept + layer
-      await explanationCacheService.deleteExplanation(curr.id, state.currentLayer);
-
-      // Force re-fetch by clearing references
-      lastFetchedKeyRef.current = null;
-      generatingConceptsRef.current.delete(`${curr.id}-${state.currentLayer}`);
-
-      // Now fetch new explanation
-      await fetchExplanation(curr.id, state.currentLayer);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Failed to regenerate explanation';
-      logger.error('useConceptNavigation', 'Failed to regenerate explanation', {
-        conceptId: curr.id,
-        layer: state.currentLayer,
-        error: msg
+      generatingSetRef.current.add(currentConcept.id);
+      const conceptPath = buildConceptPath(currentConcept.id);
+      const explanation = await fetchExplanation({
+        conceptId: currentConcept.id,
+        conceptPath,
+        forceRegenerate: true
       });
+
       setState(prev => ({
         ...prev,
-        error: msg,
-        isLoading: false
-      }));
-    }
-  }, [state.currentIndex, state.currentLayer, state.isLoading, fetchExplanation, flatConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 8) Keep progress up to date if currentIndex or layer changes
-  // -------------------------------------------------------------------------------------------
-  useEffect(() => {
-    const layerConcepts = getLayerConcepts();
-    const all = flatConcepts();
-    const currentC = all[state.currentIndex];
-    const iInLayer = layerConcepts.findIndex(c => c.id === currentC?.id);
-
-    setState(prev => ({
-      ...prev,
-      totalConceptsInLayer: layerConcepts.length,
-      completedConceptsInLayer: iInLayer >= 0 ? iInLayer + 1 : 0,
-      progress: layerConcepts.length > 0 && iInLayer >= 0
-        ? ((iInLayer + 1) / layerConcepts.length) * 100
-        : 0
-    }));
-  }, [state.currentIndex, state.currentLayer, flatConcepts, getLayerConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 9) Auto-fetch explanation each time the current concept or layer changes
-  // -------------------------------------------------------------------------------------------
-  useEffect(() => {
-    const all = flatConcepts();
-    const currentC = all[state.currentIndex];
-    if (currentC) {
-      fetchExplanation(currentC.id, state.currentLayer);
-    }
-  }, [state.currentIndex, state.currentLayer, fetchExplanation, flatConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // 10) Helper to return the current concept
-  // -------------------------------------------------------------------------------------------
-  const getCurrentConcept = useCallback((): ConceptIndex | null => {
-    const all = flatConcepts();
-    return all[state.currentIndex] || null;
-  }, [state.currentIndex, flatConcepts]);
-
-  // -------------------------------------------------------------------------------------------
-  // Debugging: Log the entire concept tree once
-  // -------------------------------------------------------------------------------------------
-  useEffect(() => {
-    logger.info('ConceptTree', '=== Full Concept Tree Structure ===');
-    logger.info('ConceptTree', `Session ID: ${session.id}`);
-    logger.info('ConceptTree', `Total Root Concepts: ${session.concepts.length}`);
-    const logConcepts = (concepts: ConceptIndex[], depth = 0) => {
-      concepts.forEach(c => {
-        const prefix = '  '.repeat(depth);
-        logger.info('ConceptTree', `${prefix}${c.id}: ${c.title}`, {
-          childCount: c.children?.length ?? 0
-        });
-        if (c.children?.length) {
-          logConcepts(c.children, depth + 1);
+        explanation,
+        isLoading: false,
+        regenerationProgress: {
+          isRegenerating: false,
+          progress: 100
         }
-      });
-    };
-    logConcepts(session.concepts, 0);
-    logger.info('ConceptTree', '===================================');
-  }, [session.id, session.concepts]);
+      }));
+    } catch (error) {
+      setState(prev => ({
+        ...prev,
+        error: error instanceof Error ? error.message : 'Failed to regenerate explanation',
+        isLoading: false,
+        regenerationProgress: {
+          isRegenerating: false,
+          progress: 0
+        }
+      }));
+    } finally {
+      generatingSetRef.current.delete(currentConcept.id);
+    }
+  }, [getCurrentConcept, buildConceptPath]);
 
-  // -------------------------------------------------------------------------------------------
-  // 11) Return the navigation interface
-  // -------------------------------------------------------------------------------------------
+  // Effect to fetch explanation when current concept changes
+  useEffect(() => {
+    const currentConcept = getCurrentConcept();
+    if (!currentConcept || generatingSetRef.current.has(currentConcept.id)) return;
+
+    setState(prev => ({ ...prev, isLoading: true, error: null }));
+
+    const fetchCurrentExplanation = async () => {
+      try {
+        generatingSetRef.current.add(currentConcept.id);
+        const conceptPath = buildConceptPath(currentConcept.id);
+        const explanation = await fetchExplanation({
+          conceptId: currentConcept.id,
+          conceptPath
+        });
+
+        setState(prev => ({
+          ...prev,
+          explanation,
+          isLoading: false
+        }));
+      } catch (error) {
+        setState(prev => ({
+          ...prev,
+          error: error instanceof Error ? error.message : 'Failed to fetch explanation',
+          isLoading: false
+        }));
+      } finally {
+        generatingSetRef.current.delete(currentConcept.id);
+      }
+    };
+
+    fetchCurrentExplanation();
+  }, [state.currentConceptId, getCurrentConcept, buildConceptPath]);
+
   return {
     state,
     nextConcept,
     previousConcept,
-    changeLayer,
     regenerateExplanation,
-    getCurrentConcept,
-    getLayerConcepts
+    getVisibleConcepts,
+    getCurrentConcept
   };
-} 
+}

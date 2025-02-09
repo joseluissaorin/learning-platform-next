@@ -1,40 +1,37 @@
+// learning-session.tsx
 "use client";
 
-import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import {
-  ChevronRight,
-  ChevronLeft,
-  BookOpen,
-  Layers,
-  RefreshCw,
-} from "lucide-react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import { ChevronRight, ChevronLeft, BookOpen, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { type LearningSessionProps } from "@/types/learning";
+import { type ConceptIndex } from "@/types/analysis";
 import { ConceptQuestion } from "./concept-question";
 import { QuestionPanel } from "./question-panel";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { motion, AnimatePresence } from "framer-motion";
-import type { HTMLMotionProps } from "framer-motion";
-import ReactMarkdown from 'react-markdown';
-import { SessionActivityService } from '@/lib/services/session-activity';
-import { useConceptNavigation } from '@/lib/hooks/useConceptNavigation';
-import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
-import { ShortcutTooltip } from '@/components/ui/shortcut-tooltip';
-import { useFocusManagement } from '@/lib/hooks/useFocusManagement';
-import { ScreenReaderText } from '@/components/ui/screen-reader-text';
+import ReactMarkdown from "react-markdown";
+import { useConceptNavigation } from "@/lib/hooks/useConceptNavigation";
+import { ShortcutTooltip } from "@/components/ui/shortcut-tooltip";
+import { ScreenReaderText } from "@/components/ui/screen-reader-text";
 import { RegenerationProgress } from "@/components/ui/regeneration-progress";
 import { Toast, ToastContainer } from "@/components/ui/toast";
-import { DebugPanel } from '@/components/debug/debug-panel';
-import { LayerControls } from "@/components/ui/layer-controls";
 import { ConceptPath } from "@/components/ui/concept-path";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "@/components/ui/tooltip";
+import { SessionTimeService } from "@/lib/services/session-time";
+import { assessmentService } from "@/lib/services/assessment-service";
+import { AssessmentModal } from "./assessment-modal";
+import { type AssessmentBlockStatus } from "@/lib/services/assessment-service";
+import { AlertDialog, AlertDialogContent, AlertDialogDescription, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+import { useToast } from "@/components/ui/use-toast";
 
 const ChatIcon = () => (
-  <svg 
-    xmlns="http://www.w3.org/2000/svg" 
-    viewBox="0 0 24 24" 
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
     fill="currentColor"
     className="h-12 w-12"
   >
@@ -44,9 +41,9 @@ const ChatIcon = () => (
 );
 
 const CircleArrowLeft = () => (
-  <svg 
-    xmlns="http://www.w3.org/2000/svg" 
-    viewBox="0 0 24 24" 
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
     fill="currentColor"
     className="h-12 w-12"
   >
@@ -55,366 +52,399 @@ const CircleArrowLeft = () => (
   </svg>
 );
 
-const QuestionMark = () => (
-  <svg  
-    xmlns="http://www.w3.org/2000/svg"  
-    width="24"  
-    height="24"  
-    viewBox="0 0 24 24"  
-    fill="none"  
-    stroke="currentColor"  
-    strokeWidth="2"  
-    strokeLinecap="round"  
-    strokeLinejoin="round"
-    className="h-8 w-8"
-  >
-    <path stroke="none" d="M0 0h24v24H0z" fill="none"/>
-    <path d="M8 8a3.5 3 0 0 1 3.5 -3h1a3.5 3 0 0 1 3.5 3a3 3 0 0 1 -2 3a3 4 0 0 0 -2 4" />
-    <path d="M12 19l0 .01" />
-  </svg>
-);
-
-const LoadingSpinner = ({ 
-  isRegenerating,
-  completedLayers,
-  totalLayers
-}: { 
-  isRegenerating: boolean;
-  completedLayers: number;
-  totalLayers: number;
-}) => (
-  <div className="flex flex-col items-center justify-center h-full space-y-4">
-    <div className="animate-spin">
-      <RefreshCw className="h-8 w-8 text-primary" />
-    </div>
-    <p className="text-sm text-muted-foreground">
-      {isRegenerating ? "Regenerating explanations..." : "Loading explanation..."}
-    </p>
-    {isRegenerating && (
-      <RegenerationProgress
-        completedLayers={completedLayers}
-        totalLayers={totalLayers}
-        className="w-64"
-      />
-    )}
-  </div>
-);
-
-const ErrorDisplay = ({ error, onRetry }: { error: string; onRetry: () => void }) => (
-  <div className="flex flex-col items-center justify-center h-full space-y-4">
-    <p className="text-sm text-red-500">{error}</p>
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={onRetry}
-      className="text-muted-foreground hover:text-primary"
-    >
-      Try Again
-    </Button>
-  </div>
-);
-
-interface Concept {
-  id: string;
-  title: string;
-  content: string;
+interface ShortcutTooltipProps {
+  text: string;
+  children: React.ReactNode;
 }
 
-interface ContentMotionProps extends HTMLMotionProps<"div"> {
-  children: React.ReactNode;
+interface QuestionPanelProps {
+  concept: ConceptIndex;
+  explanation: string | null;
+  session: LearningSessionProps;
 }
 
 export function LearningSession({ session }: LearningSessionProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [showQuestion, setShowQuestion] = useState(false);
   const [showQuestionPanel, setShowQuestionPanel] = useState(false);
   const [activeExplanationId, setActiveExplanationId] = useState<string | null>(null);
+  const [showAssessment, setShowAssessment] = useState(false);
+  const [isCheckingAssessment, setIsCheckingAssessment] = useState(false);
+  const [blockStatus, setBlockStatus] = useState<AssessmentBlockStatus | null>(null);
+  const { toast } = useToast();
 
   const {
     state: {
-      currentLayer,
       explanation,
       isLoading,
       error,
       progress,
-      totalConceptsInLayer,
-      completedConceptsInLayer,
-      currentPath,
-      regenerationProgress,
-      toast
+      totalVisible: totalConcepts,
+      visibleIndex: currentConceptIndex,
+      regenerationProgress
     },
     nextConcept,
     previousConcept,
-    changeLayer,
     regenerateExplanation,
     getCurrentConcept,
-    getLayerConcepts
+    getVisibleConcepts
   } = useConceptNavigation(session);
 
   const currentConcept = getCurrentConcept();
-  const layerConcepts = getLayerConcepts();
+  const concepts = getVisibleConcepts();
+  const conceptPath = currentConcept?.title ? [currentConcept.title] : [];
+
+  // Start time tracking when session mounts
+  useEffect(() => {
+    const startTimeTracking = async () => {
+      try {
+        await SessionTimeService.startTracking(session.id);
+      } catch (error) {
+        console.error('Failed to start time tracking:', error);
+      }
+    };
+
+    startTimeTracking();
+
+    // End time tracking when component unmounts
+    return () => {
+      const endTimeTracking = async () => {
+        try {
+          await SessionTimeService.endTracking(session.id);
+        } catch (error) {
+          console.error('Failed to end time tracking:', error);
+        }
+      };
+
+      endTimeTracking();
+    };
+  }, [session.id]);
+
+  // Add assessment check when progress changes
+  useEffect(() => {
+    const checkAssessment = async () => {
+      if (isCheckingAssessment) return;
+      
+      setIsCheckingAssessment(true);
+      try {
+        const shouldAssess = await assessmentService.shouldTriggerAssessment(session);
+        if (shouldAssess) {
+          setShowAssessment(true);
+        }
+      } catch (error) {
+        console.error('Error checking assessment:', error);
+      } finally {
+        setIsCheckingAssessment(false);
+      }
+    };
+
+    checkAssessment();
+  }, [session, progress, isCheckingAssessment]);
+
+  // Add progress block check
+  useEffect(() => {
+    const checkProgressBlock = async () => {
+      try {
+        const status = await assessmentService.getProgressBlockStatus(session);
+        setBlockStatus(status);
+        if (status.isBlocked && !showAssessment) {
+          setShowAssessment(true);
+        }
+      } catch (error) {
+        console.error('Error checking progress block:', error);
+      }
+    };
+
+    checkProgressBlock();
+  }, [session, showAssessment]);
 
   const handleQuestionPanelToggle = useCallback((explanationId: string) => {
     setActiveExplanationId(explanationId);
     setShowQuestionPanel(!showQuestionPanel);
   }, [showQuestionPanel]);
 
-  const handleConceptComplete = useCallback(() => {
-    setShowQuestion(false);
-    if (completedConceptsInLayer < totalConceptsInLayer) {
-      nextConcept();
+  const handleAssessmentComplete = () => {
+    setShowAssessment(false);
+  };
+
+  const handleAssessmentClose = () => {
+    setShowAssessment(false);
+  };
+
+  // Modify nextConcept to check for blocks
+  const handleNextConcept = async () => {
+    if (blockStatus?.isBlocked) {
+      setShowAssessment(true);
+      return;
     }
-  }, [completedConceptsInLayer, totalConceptsInLayer, nextConcept]);
+    nextConcept();
+  };
+
+  const handleShowToast = useCallback((message: string, type: 'success' | 'error' | 'info' | 'warning') => {
+    toast({
+      title: type.charAt(0).toUpperCase() + type.slice(1),
+      description: message,
+      variant: type === 'warning' ? 'destructive' : undefined
+    });
+  }, [toast]);
 
   return (
-    <div ref={containerRef} className="space-y-6">
-      {/* Header with Title, Progress, and Chat */}
-      <div className="grid grid-cols-[1fr,auto] gap-4">
-        <div className="group p-2 rounded-lg hover:bg-background/50 transition-all duration-300">
-          <p className="text-sm text-muted-foreground group-hover:text-primary/70 transition-colors duration-300">
-            Current Session
-          </p>
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-6 select-none">
-              <h2 className="text-3xl font-bold tracking-tight group-hover:text-primary transition-colors duration-300">
-                {session.title}
-              </h2>
-              <div className="flex items-center gap-4 flex-grow max-w-md">
-                <Progress 
-                  value={progress} 
-                  className={cn(
-                    "h-1.5 transition-all duration-300",
-                    progress === 100 && "bg-primary/20"
-                  )} 
-                />
-                <span className="text-lg font-semibold text-muted-foreground min-w-[3rem] text-right">
-                  {Math.round(progress)}%
-                </span>
+    <TooltipProvider>
+      <div ref={containerRef} className="space-y-6">
+        {/* Header */}
+        <div className="grid grid-cols-[1fr,auto] gap-4">
+          <div className="group p-2 rounded-lg hover:bg-background/50 transition-all duration-300">
+            <p className="text-sm text-muted-foreground group-hover:text-primary/70 transition-colors duration-300">
+              Current Session
+            </p>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-6 select-none">
+                <h2 className="text-3xl font-bold tracking-tight group-hover:text-primary transition-colors duration-300">
+                  {session.title}
+                </h2>
+                <div className="flex items-center gap-4 flex-grow max-w-md">
+                  <Progress
+                    value={progress}
+                    className={cn(
+                      "h-1.5 transition-all duration-300",
+                      progress === 100 && "bg-primary/20"
+                    )}
+                  />
+                  <span className="text-lg font-semibold text-muted-foreground min-w-[3rem] text-right">
+                    {Math.round(progress)}%
+                  </span>
+                </div>
               </div>
+              <ConceptPath 
+                path={conceptPath} 
+                currentLayer={3} 
+                className="mt-2" 
+              />
             </div>
-            <ConceptPath 
-              path={currentPath} 
-              currentLayer={currentLayer}
-              className="mt-2" 
-            />
+          </div>
+
+          <div className="flex items-center">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => handleQuestionPanelToggle(activeExplanationId || currentConcept?.id || "")}
+              className="transition-all duration-300 hover:scale-105 hover:bg-background/50 h-24 w-24 relative"
+              disabled={isLoading}
+            >
+              {showQuestionPanel ? <CircleArrowLeft /> : <ChatIcon />}
+              <span className="sr-only">
+                {showQuestionPanel ? "Close question panel" : "Open question panel"}
+              </span>
+            </Button>
           </div>
         </div>
 
-        {/* Chat Button */}
-        <div className="flex items-center">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => handleQuestionPanelToggle(activeExplanationId || currentConcept?.id || "")}
-            className="transition-all duration-300 hover:scale-105 hover:bg-background/50 h-24 w-24 relative"
-            disabled={isLoading}
-          >
-            {/* Your existing chat button content */}
-          </Button>
-        </div>
-      </div>
-
-      {/* Main Content */}
-      <AnimatePresence initial={false} mode="wait">
-        <motion.div
-          key={showQuestionPanel ? "split" : "full"}
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.2 }}
-          className="w-full"
-        >
+        {/* Main Content */}
+        <AnimatePresence initial={false} mode="wait">
           <motion.div
-            layout
-            className={cn(
-              "grid gap-8",
-              showQuestionPanel ? "grid-cols-[7fr,5fr]" : "grid-cols-1"
-            )}
-            transition={{ duration: 0.3, ease: "easeInOut" }}
+            key={showQuestionPanel ? "split" : "full"}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="w-full"
           >
-            {/* Main Content Area */}
             <motion.div
               layout
-              key={`${currentConcept?.id}-${currentLayer}`}
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
               className={cn(
-                "rounded-lg min-h-[600px]",
-                showQuestionPanel ? "" : "col-span-full"
+                "grid gap-8",
+                showQuestionPanel ? "grid-cols-[7fr,5fr]" : "grid-cols-1"
               )}
+              transition={{ duration: 0.3, ease: "easeInOut" }}
             >
-              <Card className="border-0 shadow-none h-full">
-                <div className="p-6 space-y-6">
-                  {!showQuestion ? (
-                    <>
-                      <div className="flex items-center justify-between">
-                        <div className="space-y-1">
-                          <div className="flex items-center space-x-2">
-                            <BookOpen className="h-5 w-5 text-primary" />
-                            <h3 className="text-2xl font-semibold tracking-tight">
-                              {currentConcept?.title}
-                            </h3>
+              <motion.div
+                layout
+                key={currentConcept?.id}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                transition={{ duration: 0.3 }}
+                className={cn(
+                  "rounded-lg min-h-[600px]",
+                  showQuestionPanel ? "" : "col-span-full"
+                )}
+              >
+                <Card className="border-0 shadow-none h-full">
+                  <div className="p-6 space-y-6">
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-1">
+                        <div className="flex items-center space-x-2">
+                          <BookOpen className="h-5 w-5 text-primary" />
+                          <h3 className="text-2xl font-semibold tracking-tight">
+                            {currentConcept?.title}
+                          </h3>
+                        </div>
+                        <p className="text-sm text-muted-foreground">
+                          Concept {currentConceptIndex + 1} of {totalConcepts}
+                        </p>
+                      </div>
+
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={regenerateExplanation}
+                        disabled={isLoading || regenerationProgress.isRegenerating}
+                        className="relative"
+                      >
+                        <RefreshCw className={cn(
+                          "h-5 w-5 transition-all",
+                          regenerationProgress.isRegenerating && "animate-spin"
+                        )} />
+                        <span className="sr-only">Regenerate explanation</span>
+                      </Button>
+                    </div>
+
+                    <div className="relative h-[calc(100vh-32rem)] min-h-[250px]">
+                      <div className="absolute inset-0 overflow-y-auto custom-scrollbar">
+                        {isLoading ? (
+                          <div className="px-1">
+                            <LoadingState
+                              state={regenerationProgress.isRegenerating ? "regenerating" : "generating"}
+                              progress={regenerationProgress.progress}
+                            />
                           </div>
-                          <p className="text-sm text-muted-foreground">
-                            {completedConceptsInLayer} of {totalConceptsInLayer} concepts at Layer {currentLayer}
-                          </p>
-                        </div>
-
-                        <LayerControls
-                          currentLayer={currentLayer}
-                          isLoading={isLoading}
-                          onLayerChange={changeLayer}
-                          path={currentPath}
-                        />
+                        ) : error ? (
+                          <div className="p-4 text-red-500">
+                            {error}
+                          </div>
+                        ) : (
+                          <div className="prose prose-sm dark:prose-invert max-w-none">
+                            <ReactMarkdown>{explanation || ""}</ReactMarkdown>
+                          </div>
+                        )}
                       </div>
+                    </div>
 
-                      {/* Content Area */}
-                      <div className="relative h-[calc(100vh-32rem)] min-h-[250px]">
-                        <div className="transition-opacity duration-200">
-                          {isLoading ? (
-                            <div className="opacity-100">
-                              <LoadingState 
-                                state={regenerationProgress.isRegenerating ? 'regenerating' : 
-                                  currentLayer === 1 ? 'summarizing' :
-                                  currentLayer === 2 ? 'analyzing' : 'generating'
-                                }
-                                layer={currentLayer}
-                                progress={regenerationProgress.isRegenerating ? 
-                                  (regenerationProgress.completedLayers / regenerationProgress.totalLayers) * 100 : 
-                                  undefined
-                                }
-                              />
-                            </div>
-                          ) : error ? (
-                            <div className="opacity-100">
-                              <ErrorDisplay 
-                                error={error} 
-                                onRetry={regenerateExplanation} 
-                              />
-                            </div>
-                          ) : (
-                            <div className="prose prose-lg max-w-none dark:prose-invert opacity-100">
-                              <ReactMarkdown>{explanation || currentConcept?.content || ""}</ReactMarkdown>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Navigation Controls */}
-                      <div className="flex items-center justify-between pt-4 space-x-4">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={previousConcept}
-                          disabled={completedConceptsInLayer <= 1 || isLoading}
-                          className="relative group"
-                        >
-                          <ChevronLeft className="h-5 w-5" />
-                          <ShortcutTooltip shortcut="←" />
-                        </Button>
-
-                        <div className="flex gap-4">
+                    <div className="flex justify-between pt-4">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
                           <Button
-                            variant="outline"
-                            onClick={() => setShowQuestion(true)}
-                            disabled={isLoading}
-                            className="relative group"
+                            variant="ghost"
+                            size="sm"
+                            onClick={previousConcept}
+                            disabled={currentConceptIndex === 0 || isLoading}
+                            className="gap-2"
                           >
-                            <QuestionMark className="h-5 w-5 mr-2" />
-                            Test Understanding
-                            <ShortcutTooltip shortcut="Q" />
+                            <ChevronLeft className="h-4 w-4" />
+                            Previous
                           </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Previous (←)</TooltipContent>
+                      </Tooltip>
 
+                      <Tooltip>
+                        <TooltipTrigger asChild>
                           <Button
-                            variant="outline"
-                            onClick={regenerateExplanation}
-                            disabled={isLoading}
-                            className="relative group"
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleNextConcept}
+                            disabled={
+                              currentConceptIndex === totalConcepts - 1 || 
+                              isLoading || 
+                              (blockStatus?.isBlocked && !showAssessment)
+                            }
+                            className="gap-2"
                           >
-                            <RefreshCw className={cn(
-                              "h-5 w-5 mr-2",
-                              isLoading && "animate-spin"
-                            )} />
-                            Regenerate
-                            <ShortcutTooltip shortcut="R" />
+                            Next
+                            <ChevronRight className="h-4 w-4" />
                           </Button>
-                        </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {blockStatus?.isBlocked 
+                            ? "Complete the assessment to continue"
+                            : "Next (→)"}
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                  </div>
+                </Card>
+              </motion.div>
 
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={nextConcept}
-                          disabled={completedConceptsInLayer >= totalConceptsInLayer || isLoading}
-                          className="relative group"
-                        >
-                          <ChevronRight className="h-5 w-5" />
-                          <ShortcutTooltip shortcut="→" />
-                        </Button>
-                      </div>
-                    </>
-                  ) : (
-                    <ConceptQuestion
-                      concept={currentConcept as Concept}
-                      onComplete={handleConceptComplete}
-                      onBack={() => setShowQuestion(false)}
-                    />
-                  )}
-                </div>
-              </Card>
-            </motion.div>
-
-            {/* Question Panel */}
-            <AnimatePresence mode="wait">
-              {showQuestionPanel && (
+              {showQuestionPanel && currentConcept && (
                 <motion.div
                   layout
                   initial={{ opacity: 0, x: 20 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 20 }}
-                  transition={{ duration: 0.3, ease: "easeInOut" }}
+                  transition={{ duration: 0.3 }}
                 >
                   <QuestionPanel
-                    explanationId={activeExplanationId || currentConcept?.id || ""}
-                    concept={currentConcept as Concept}
+                    explanationId={activeExplanationId || currentConcept.id}
+                    concept={currentConcept}
                     explanation={explanation}
+                    session={session}
                   />
                 </motion.div>
               )}
-            </AnimatePresence>
+            </motion.div>
           </motion.div>
-        </motion.div>
-      </AnimatePresence>
+        </AnimatePresence>
 
-      {/* Toast and Debug Panel */}
-      <ToastContainer>
-        {toast.type && toast.message && (
-          <Toast type={toast.type} message={toast.message} />
+        <ToastContainer>
+          {error && <Toast type="error" message={error} />}
+        </ToastContainer>
+
+        {/* Progress Block Alert */}
+        {blockStatus?.isBlocked && !showAssessment && (
+          <AlertDialog open>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Progress Blocked</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {blockStatus.reason}
+                  <div className="mt-4">
+                    <p>Required Score: {blockStatus.requiredScore}%</p>
+                    <p>Your Score: {blockStatus.currentScore}%</p>
+                  </div>
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <div className="flex justify-end space-x-4 mt-4">
+                <Button 
+                  onClick={() => {
+                    setShowAssessment(true);
+                    handleShowToast('Starting assessment...', 'info');
+                  }}
+                >
+                  Take Assessment
+                </Button>
+              </div>
+            </AlertDialogContent>
+          </AlertDialog>
         )}
-      </ToastContainer>
 
-      {process.env.NODE_ENV === 'development' && (
-        <DebugPanel
-          state={{
-            session,
-            currentConcept,
-            currentLayer,
-            explanation,
-            isLoading,
-            error,
-            progress,
-            totalConceptsInLayer,
-            completedConceptsInLayer,
-            regenerationProgress,
-            showQuestion,
-            showQuestionPanel,
-            activeExplanationId,
-            currentPath
-          }}
-          module="LearningSession"
-        />
-      )}
-    </div>
+        {/* Assessment Modal */}
+        {showAssessment && (
+          <AssessmentModal
+            session={session}
+            onComplete={async () => {
+              setShowAssessment(false);
+              // Recheck block status after assessment
+              try {
+                const newStatus = await assessmentService.getProgressBlockStatus(session);
+                setBlockStatus(newStatus);
+                if (!newStatus.isBlocked) {
+                  handleShowToast('You can now continue with your learning session.', 'success');
+                }
+              } catch (error) {
+                console.error('Error checking block status:', error);
+                handleShowToast('Failed to update progress status. Please refresh the page.', 'error');
+              }
+            }}
+            onClose={() => {
+              if (!blockStatus?.isBlocked) {
+                setShowAssessment(false);
+              } else {
+                handleShowToast('You need to complete the assessment to continue.', 'warning');
+              }
+            }}
+            onShowToast={handleShowToast}
+          />
+        )}
+      </div>
+    </TooltipProvider>
   );
-} 
+}

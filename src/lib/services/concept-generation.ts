@@ -1,11 +1,12 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { env } from "@/lib/env";
+import { env } from "@/env.mjs";
 import { prisma } from "@/lib/db/prisma";
 import { getRedisClient } from "@/lib/redis/client";
 import fs from "fs";
 import path from "path";
 import { type GenerateContentResult } from "@google/generative-ai";
 import { type ConceptExplanation } from "@prisma/client";
+import { logger } from '@/lib/debug/logger';
 
 interface ConceptRelation {
   sourceId: string;
@@ -41,21 +42,18 @@ interface ExplanationResponse {
 
 export class ConceptGenerationService {
   private genAI: GoogleGenerativeAI;
-  private model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
+  private model: any;
   private redis: ReturnType<typeof getRedisClient> | null = null;
 
   constructor() {
-    console.log('API Key prefix:', env.GOOGLE_API_KEY.substring(0, 8) + '...');
-    this.genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
+    // Initialize with a placeholder key, will be set per request
+    this.genAI = new GoogleGenerativeAI('placeholder-key');
     this.model = this.genAI.getGenerativeModel({
       model: "gemini-2.0-flash-exp",
-      generationConfig: {
-        temperature: 1.0,
-        topP: 0.8,
-        topK: 40,
-        maxOutputTokens: 8192,
-      },
     });
+
+    logger.info('ConceptGenerationService', 'Initialized with placeholder key');
+
     if (typeof window === 'undefined') {
       this.redis = getRedisClient();
     }

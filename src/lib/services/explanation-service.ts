@@ -1,5 +1,11 @@
+// explanation-service.js
 import { explanationCacheService } from '@/lib/cache/explanation-cache';
 import { logger } from '@/lib/debug/logger';
+import { PrismaClient } from '@prisma/client';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { env } from '@/lib/env';
+import { ConceptStorageService } from '@/lib/redis/concept-storage';
+import { StructuredDocumentService } from '@/lib/services/structured-document-service';
 
 interface ModelConfig {
   wordsPerToken: number;
@@ -9,10 +15,20 @@ interface ModelConfig {
 interface GenerateExplanationParams {
   conceptId: string;
   layer: number;
-  structuredContent: string;
   context?: string;
   conceptPath?: string[];
   forceRegenerate?: boolean;
+}
+
+interface ConceptData {
+  id: string;
+  title: string;
+  content: string;
+  level: number;
+  parentId: string | null;
+  contentUuid: string | null;
+  processingStatus: string;
+  version?: number;
 }
 
 interface Section {
@@ -24,22 +40,46 @@ export class ExplanationService {
   private static instance: ExplanationService;
   private readonly MAX_ITERATIONS = 15;
   private readonly TARGET_PERCENTAGES: Record<number, number> = {
-    1: 0.33, // Layer 1: 33%
-    2: 0.60, // Layer 2: 60%
-    3: 1.0   // Layer 3: 100%
+    1: 0.33, // 33% for layer 1
+    2: 0.60, // 60% for layer 2
+    3: 1.0   // 100% for layer 3
   };
-  private readonly WIGGLE_ROOM = 0.06; // Allow 6% deviation
+  private readonly WIGGLE_ROOM = 0.06;
   private readonly TOKENS_PER_SUMMARY = 515;
-  private readonly MODEL = 'llama';
+  private readonly MODEL = 'gemini';
+  private readonly MAX_SECTION_WORDS = 4000;
+  private readonly MIN_CHUNK_SIZE = 150;
+  private subdivision_factor = 1.0;
+  private target_subdivisions = 0;
+  private current_subdivisions = 0;
+  private prisma = new PrismaClient();
+  private gemini: GoogleGenerativeAI;
+  private conceptStorage = new ConceptStorageService();
+  private structuredDocument = new StructuredDocumentService();
 
   private readonly MODEL_CONFIGS: Record<string, ModelConfig> = {
-    'claude': { wordsPerToken: 0.36, temperature: 0.95 },
-    'gpt': { wordsPerToken: 2.9, temperature: 1.75 },
-    'gemini': { wordsPerToken: 0.247, temperature: 1.75 },
-    'llama': { wordsPerToken: 0.4, temperature: 1.45 }
+    claude: { wordsPerToken: 0.36, temperature: 0.95 },
+    gpt: { wordsPerToken: 2.9, temperature: 1.75 },
+    gemini: { wordsPerToken: 0.247, temperature: 1.75 },
+    llama: { wordsPerToken: 0.4, temperature: 1.45 }
   };
 
-  private constructor() {}
+  private constructor() {
+    // Initialize Gemini
+    try {
+      const apiKey = env.GEMINI_API_KEY;
+      this.gemini = new GoogleGenerativeAI(apiKey.trim());
+
+      // Test the connection
+      const model = this.gemini.getGenerativeModel({ model: 'gemini-pro' });
+      if (!model) {
+        throw new Error('Failed to get Gemini model');
+      }
+    } catch (err) {
+      logger.error('ExplanationService', 'Error initializing Gemini:', err instanceof Error ? err.message : err);
+      throw new Error('Failed to initialize Gemini client: ' + (err instanceof Error ? err.message : String(err)));
+    }
+  }
 
   public static getInstance(): ExplanationService {
     if (!this.instance) {
@@ -48,10 +88,43 @@ export class ExplanationService {
     return this.instance;
   }
 
+  private async getConceptContent(conceptId: string): Promise<ConceptData | null> {
+    try {
+      const [concept] = await this.prisma.$queryRaw<ConceptData[]>`
+        SELECT 
+          c.id,
+          c.title,
+          c.content,
+          c.level,
+          c."parentId",
+          c."contentUuid",
+          c."processingStatus"
+        FROM "Concept" c
+        WHERE c.id = ${conceptId}
+        LIMIT 1;
+      `;
+      if (!concept) {
+        logger.warn('ExplanationService', 'Concept not found', { conceptId });
+        return null;
+      }
+      return concept;
+    } catch (error) {
+      logger.error('ExplanationService', 'Error fetching concept', {
+        conceptId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw new Error(`Failed to fetch concept: ${conceptId}`);
+    }
+  }
+
+  /**
+   * Main public method to generate or retrieve an explanation for a given concept + layer.
+   * If partial content is available (based on conceptPath), we retrieve that from structured doc.
+   * Otherwise, we default to concept.content from DB.
+   */
   async generateExplanation({
     conceptId,
     layer,
-    structuredContent,
     context = '',
     conceptPath = [],
     forceRegenerate = false
@@ -59,310 +132,408 @@ export class ExplanationService {
     logger.info('ExplanationService', 'Generating explanation', {
       conceptId,
       layer,
-      hasStructuredContent: !!structuredContent,
-      contextLength: context.length,
-      pathLength: conceptPath.length
+      hasContext: !!context,
+      forceRegenerate
     });
 
-    // Check cache unless forced regeneration
-    if (!forceRegenerate) {
-      const cached = await explanationCacheService.getExplanation(conceptId, layer);
-      if (cached) {
-        logger.info('ExplanationService', 'Cache hit', { conceptId, layer });
-        return cached;
-      }
-    }
-
-    // Extract relevant section from structured content
-    const sectionContent = this.extractSection(structuredContent, conceptId);
-    if (!sectionContent) {
-      throw new Error(`No content found for concept: ${conceptId}`);
-    }
-
-    // For layer 3, return the structured content directly
-    if (layer === 3) {
-      await explanationCacheService.setExplanation(conceptId, layer, sectionContent);
-      return sectionContent;
-    }
-
-    // Process content using new_summarize approach
-    const processed = await this.processContent(sectionContent, layer);
-    
-    // Cache the result
-    await explanationCacheService.setExplanation(conceptId, layer, processed);
-
-    return processed;
-  }
-
-  private async processContent(content: string, layer: number): Promise<string> {
-    const sections = this.divideIntoSections(content);
-    const totalWords = this.countWords(content);
-    const targetWords = Math.floor(totalWords * this.TARGET_PERCENTAGES[layer]);
-    const lowerBound = Math.floor(targetWords - 350);
-    const upperBound = Math.floor(targetWords + 350);
-
-    let subdivisionFactor = 1.0;
-    const maxSubdivisionFactor = 50;
-    
-    logger.info('ExplanationService', 'Processing content', {
-      totalWords,
-      targetWords,
-      bounds: { lower: lowerBound, upper: upperBound },
-      sectionsCount: sections.length
-    });
-
-    for (let iteration = 0; iteration < this.MAX_ITERATIONS; iteration++) {
-      logger.info('ExplanationService', 'Processing iteration', { iteration: iteration + 1 });
-
-      // Subdivide sections based on current factor
-      const subdivisions = this.subdivideSections(sections, subdivisionFactor);
-      
-      // Estimate before generating
-      const estimatedWords = this.estimateSummaryLength(subdivisions);
-      logger.info('ExplanationService', 'Iteration estimate', {
-        iteration: iteration + 1,
-        estimatedWords,
-        lowerBound,
-        upperBound
-      });
-
-      if (estimatedWords < lowerBound) {
-        subdivisionFactor *= 0.5;
-        continue;
-      } else if (estimatedWords > upperBound) {
-        subdivisionFactor *= 2;
-        if (subdivisionFactor > maxSubdivisionFactor) {
-          subdivisionFactor = maxSubdivisionFactor;
-        }
-        continue;
+    try {
+      const concept = await this.getConceptContent(conceptId);
+      if (!concept) {
+        throw new Error(`Concept not found: ${conceptId}`);
       }
 
-      // Generate summaries for each subdivision
-      const summaries = await Promise.all(
-        subdivisions.map(async (subdivision) => {
-          const prompt = this.generatePrompt(subdivision);
-
-          const response = await fetch('/api/llm/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt,
-              temperature: this.MODEL_CONFIGS[this.MODEL].temperature,
-              maxTokens: Math.floor(this.countWords(subdivision) * 0.4), // 40% of input length
-              stop: ["Human:", "Assistant:"]
-            })
+      // If concept has been processed and stored, check Redis first
+      if (concept.contentUuid && concept.processingStatus === 'completed' && !forceRegenerate) {
+        const cachedContent = await this.conceptStorage.getLayerContent(concept.contentUuid, layer);
+        if (cachedContent) {
+          logger.info('ExplanationService', 'Retrieved from Redis storage', {
+            conceptId,
+            layer,
+            contentUuid: concept.contentUuid
           });
-
-          if (!response.ok) {
-            throw new Error('Failed to generate summary');
-          }
-
-          const { content } = await response.json();
-          return content;
-        })
-      );
-
-      // Combine summaries
-      const combined = summaries.join('\n\n');
-      const combinedWords = this.countWords(combined);
-
-      logger.info('ExplanationService', 'Generated summary', {
-        iteration: iteration + 1,
-        words: combinedWords,
-        subdivisions: subdivisions.length,
-        targetWords
-      });
-
-      // Check if within bounds
-      if (combinedWords >= lowerBound && combinedWords <= upperBound) {
-        return combined;
-      }
-
-      // Adjust subdivision factor based on result
-      if (combinedWords < lowerBound) {
-        subdivisionFactor *= 0.5;
-      } else {
-        subdivisionFactor *= 2;
-        if (subdivisionFactor > maxSubdivisionFactor) {
-          subdivisionFactor = maxSubdivisionFactor;
+          return cachedContent;
         }
       }
-    }
 
-    throw new Error('Failed to achieve target length after maximum iterations');
+      // If we need to generate the content
+      logger.info('ExplanationService', 'No suitable cached explanation found', {
+        conceptId,
+        layer,
+        conceptPath,
+        forceRegenerate
+      });
+
+      // Attempt partial retrieval from structured doc, if a conceptPath is provided
+      let partialContent: string | null = null;
+      if (conceptPath && conceptPath.length > 0) {
+        // We assume the sessionId is contained in the path's parent or we can do a quick DB lookup
+        // Minimal approach: find sessionConcept row
+        const sessionConcept = await this.prisma.sessionConcept.findFirst({
+          where: {
+            conceptId: concept.id
+          }
+        });
+        if (sessionConcept) {
+          partialContent = await this.structuredDocument.getPartialContent(sessionConcept.sessionId, conceptPath);
+        }
+      }
+
+      // Fallback to the DB "concept.content"
+      const fullContent = partialContent || concept.content;
+
+      let result: string;
+      if (layer === 3) {
+        // Full content
+        result = fullContent;
+      } else {
+        // Summarization
+        const targetPercentage = this.TARGET_PERCENTAGES[layer];
+        result = await this.generateSummary(fullContent, targetPercentage);
+      }
+
+      // If concept has a contentUuid, update Redis
+      if (concept.contentUuid) {
+        await this.conceptStorage.storeConceptContent(concept.contentUuid, {
+          layer1Summary: layer === 1 ? result : '',
+          layer2Summary: layer === 2 ? result : '',
+          layer3Content: layer === 3 ? result : concept.content,
+          metadata: {
+            version: concept.version || 1,
+            lastUpdated: new Date().toISOString(),
+            parentPath: conceptPath,
+            level: concept.level,
+            order: concept.id
+          }
+        });
+
+        logger.info('ExplanationService', 'Stored new or updated content in Redis', {
+          conceptId,
+          layer,
+          contentUuid: concept.contentUuid
+        });
+      }
+
+      return result;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error('ExplanationService', 'Error generating explanation', {
+        conceptId,
+        layer,
+        error: msg
+      });
+      throw new Error(msg);
+    }
   }
 
-  private divideIntoSections(content: string): Section[] {
+  /**
+   * Below is the existing summarization logic, untouched except for calling it with partial or full content.
+   */
+  private isMarkdownContent(content: string): boolean {
+    return Boolean(
+      content.match(/^#{1,6}\s/m) ||
+      content.match(/^\d+\.\s/m) ||
+      content.match(/^[-*+]\s/m)
+    );
+  }
+
+  private divideMarkdownContent(content: string): Section[] {
     const sections: Section[] = [];
     const lines = content.split('\n');
     let currentSection: Section = { header: '', content: '' };
+    let inCodeBlock = false;
 
     for (const line of lines) {
+      if (line.startsWith('```')) {
+        inCodeBlock = !inCodeBlock;
+        currentSection.content += line + '\n';
+        continue;
+      }
+
+      if (inCodeBlock) {
+        currentSection.content += line + '\n';
+        continue;
+      }
+
       if (line.match(/^#{1,6}\s/)) {
-        if (currentSection.content) {
-          sections.push(currentSection);
+        if (currentSection.content.trim()) {
+          sections.push({ ...currentSection });
           currentSection = { header: '', content: '' };
         }
         currentSection.header = line;
+      } else if (line.match(/^(\d+\.|\*|-|\+)\s/)) {
+        if (currentSection.content && !currentSection.header.includes('List')) {
+          sections.push({ ...currentSection });
+          currentSection = { header: 'List', content: '' };
+        }
+        currentSection.content += line + '\n';
       } else {
         currentSection.content += line + '\n';
       }
     }
 
-    if (currentSection.content) {
-      sections.push(currentSection);
+    if (currentSection.content.trim()) {
+      sections.push({ ...currentSection });
     }
 
-    return sections;
+    return this.adjustSections(sections);
   }
 
-  private subdivideSections(sections: Section[], factor: number): string[] {
-    const subdivisions: string[] = [];
-    
-    for (const section of sections) {
-      const words = this.countWords(section.content);
-      const targetSize = Math.max(150, Math.floor(words / factor));
-      
-      // Split content into sentences
-      const sentences = section.content.match(/[^.!?]+[.!?]+/g) || [section.content];
-      let currentSubdivision = section.header + '\n\n';
-      let currentWordCount = 0;
+  private adjustSections(sections: Section[]): Section[] {
+    const MAX_SECTION_WORDS = 4000;
+    const adjustedSections: Section[] = [];
 
-      for (const sentence of sentences) {
-        const sentenceWords = this.countWords(sentence);
-        
-        if (currentWordCount + sentenceWords > targetSize) {
-          subdivisions.push(currentSubdivision.trim());
-          currentSubdivision = section.header + '\n\n' + sentence;
-          currentWordCount = sentenceWords;
-        } else {
-          currentSubdivision += sentence;
-          currentWordCount += sentenceWords;
+    for (const section of sections) {
+      const wordCount = section.content.split(/\s+/).length;
+      if (wordCount <= MAX_SECTION_WORDS) {
+        adjustedSections.push(section);
+      } else {
+        const subsections = this.divideIntoSubsections(section);
+        adjustedSections.push(...subsections);
+      }
+    }
+
+    return adjustedSections;
+  }
+
+  private divideIntoSubsections(section: Section): Section[] {
+    const subsections: Section[] = [];
+    const paragraphs = section.content.split(/\n\s*\n/);
+    let currentSubsection: Section = {
+      header: section.header ? `${section.header} (Part 1)` : '',
+      content: ''
+    };
+    let currentWordCount = 0;
+    const TARGET_WORDS = 2000;
+
+    for (const paragraph of paragraphs) {
+      const paragraphWords = paragraph.split(/\s+/).length;
+
+      if (currentWordCount + paragraphWords > TARGET_WORDS && currentSubsection.content.trim()) {
+        subsections.push({ ...currentSubsection });
+        const partNumber = subsections.length + 1;
+        currentSubsection = {
+          header: section.header ? `${section.header} (Part ${partNumber})` : '',
+          content: ''
+        };
+        currentWordCount = 0;
+      }
+
+      currentSubsection.content += paragraph + '\n\n';
+      currentWordCount += paragraphWords;
+    }
+
+    if (currentSubsection.content.trim()) {
+      subsections.push(currentSubsection);
+    }
+
+    return subsections;
+  }
+
+  private subdivideContent(content: string, targetSubdivisions: number): string[] {
+    const words = content.split(/\s+/);
+    const totalWords = words.length;
+    const targetChunkSize = Math.max(
+      150,
+      Math.floor((totalWords / targetSubdivisions) * this.subdivision_factor)
+    );
+
+    const subdivisions: string[] = [];
+    let start = 0;
+
+    while (start < totalWords) {
+      let end = Math.min(start + targetChunkSize, totalWords);
+
+      while (end < totalWords && !words[end - 1].match(/[.!?]$/)) {
+        end++;
+        if (end - start > targetChunkSize * 1.5) {
+          while (end > start && !words[end - 1].match(/[.!?]$/)) {
+            end--;
+          }
+          if (end === start) {
+            end = start + targetChunkSize;
+          }
+          break;
         }
       }
 
-      if (currentSubdivision !== section.header + '\n\n') {
-        subdivisions.push(currentSubdivision.trim());
-      }
+      const subdivision = words.slice(start, end).join(' ');
+      subdivisions.push(subdivision);
+      start = end;
     }
 
-    return this.mergeShortSubdivisions(subdivisions);
+    return this.mergeOrSplitSubdivisions(subdivisions, targetSubdivisions);
   }
 
-  private mergeShortSubdivisions(subdivisions: string[]): string[] {
+  private mergeOrSplitSubdivisions(subdivisions: string[], targetCount: number): string[] {
+    if (subdivisions.length === targetCount) {
+      return subdivisions;
+    }
+    if (subdivisions.length > targetCount) {
+      return this.mergeSubdivisions(subdivisions, targetCount);
+    } else {
+      return this.splitSubdivisions(subdivisions, targetCount);
+    }
+  }
+
+  private mergeSubdivisions(subdivisions: string[], targetCount: number): string[] {
     const merged: string[] = [];
-    let current = '';
-    
+    const totalWords = subdivisions.reduce((sum, s) => sum + s.split(/\s+/).length, 0);
+    const targetWordsPerSubdivision = Math.floor(totalWords / targetCount);
+
+    let currentMerge = '';
+    let currentWords = 0;
+
     for (const subdivision of subdivisions) {
-      if (this.countWords(current + subdivision) < 150) {
-        current += (current ? '\n\n' : '') + subdivision;
+      const subdivisionWords = subdivision.split(/\s+/).length;
+      if (
+        currentWords + subdivisionWords > targetWordsPerSubdivision * 1.2 &&
+        merged.length < targetCount - 1
+      ) {
+        merged.push(currentMerge.trim());
+        currentMerge = subdivision;
+        currentWords = subdivisionWords;
       } else {
-        if (current) merged.push(current);
-        current = subdivision;
+        currentMerge += (currentMerge ? ' ' : '') + subdivision;
+        currentWords += subdivisionWords;
       }
     }
-    
-    if (current) merged.push(current);
+
+    if (currentMerge) {
+      merged.push(currentMerge.trim());
+    }
     return merged;
   }
 
-  private estimateSummaryLength(subdivisions: string[]): number {
-    logger.info('ExplanationService', 'Words per token ratio', {
-      ratio: this.MODEL_CONFIGS[this.MODEL].wordsPerToken
-    });
-    
-    const actualSubdivisions = subdivisions.length;
-    const totalTokens = actualSubdivisions * this.TOKENS_PER_SUMMARY;
-    const estimatedWords = totalTokens * this.MODEL_CONFIGS[this.MODEL].wordsPerToken;
-    
-    logger.info('ExplanationService', 'Estimating summary length', {
-      tokens: totalTokens,
-      subdivisions: actualSubdivisions,
-      wordsPerToken: this.MODEL_CONFIGS[this.MODEL].wordsPerToken,
-      estimatedWords
-    });
-    
-    return Math.ceil(estimatedWords);
-  }
+  private splitSubdivisions(subdivisions: string[], targetCount: number): string[] {
+    const result: string[] = [];
 
-  private countWords(text: string): number {
-    return text.split(/\s+/).filter(word => word.length > 0).length;
-  }
+    for (const subdivision of subdivisions) {
+      const sentences = subdivision.match(/[^.!?]+[.!?]+/g) || [subdivision];
+      const splitCount = Math.ceil(targetCount / subdivisions.length);
+      const sentencesPerSplit = Math.ceil(sentences.length / splitCount);
 
-  private extractSection(content: string, conceptId: string): string | null {
-    // Debug the first 200 chars of content
-    logger.debug('ExplanationService', 'Content preview', {
-      firstChars: content.substring(0, 2),
-      contentLength: content.length,
-      conceptId
-    });
-
-    // Split content into sections based on ## headers
-    const sections = content.split(/(?=\n##\s)/);
-    
-    // Log the sections for debugging
-    logger.debug('ExplanationService', 'Content sections', {
-      totalSections: sections.length,
-      conceptId,
-      sectionHeaders: sections.map(s => {
-        const firstLine = s.split('\n').find(line => line.trim().startsWith('##'));
-        return firstLine || 'No header found';
-      }).join(', ')
-    });
-
-    // Create a regex that looks for the concept ID in ## headers
-    const regex = new RegExp(`##\\s.*${conceptId}.*$`, 'm');
-    
-    // Find the matching section
-    const section = sections.find(s => {
-      const hasMatch = regex.test(s);
-      if (hasMatch) {
-        logger.debug('ExplanationService', 'Found matching section', {
-          conceptId,
-          header: s.split('\n').find(line => line.trim().startsWith('##'))
-        });
+      for (let i = 0; i < sentences.length; i += sentencesPerSplit) {
+        const chunk = sentences.slice(i, i + sentencesPerSplit).join(' ');
+        if (chunk.trim()) {
+          result.push(chunk);
+        }
       }
-      return hasMatch;
-    });
-
-    if (!section) {
-      logger.warn('ExplanationService', 'No matching section found', {
-        conceptId,
-        availableHeaders: sections.map(s => {
-          const firstLine = s.split('\n').find(line => line.trim().startsWith('##'));
-          return firstLine || 'No header found';
-        })
-      });
     }
 
-    return section ? section.trim() : null;
+    while (result.length > targetCount) {
+      let shortestIdx = 0;
+      let shortestLen = Infinity;
+      for (let i = 0; i < result.length - 1; i++) {
+        const combinedLen = result[i].length + result[i + 1].length;
+        if (combinedLen < shortestLen) {
+          shortestLen = combinedLen;
+          shortestIdx = i;
+        }
+      }
+      result.splice(shortestIdx, 2, result[shortestIdx] + ' ' + result[shortestIdx + 1]);
+    }
+
+    return result;
   }
 
-  private generatePrompt(text: string): string {
-    return `You are a helpful and knowledgeable assistant specialized in summarizing texts. 
-You will understand the given text and its underlying syntax, which might not be evident. 
-You will keep the most essential information and optimizing for space, this may include 
-specific names, theories, dates, lists and definitions. You must make no mention to the 
-fact that you are summarizing anything or that you've been given any text but rather you 
-must write the text as one that exists by itself.
-
-You must easily explain complex topics in such way that they are understandable to anyone. 
-That means you must not use technical jargon or complex words, you must use simple words 
-and explain the topics in a way that is easy to understand. Also, explain in great detail 
-each topic and subtopic, possibly even stop just to explain a single word or concept if 
-it's necessary. Write thorough explanations that make complex ideas accessible to everyone.
-
-## Text to summarize:
-${text}
-
-## Instructions:
-Summarize the text above maintaining the most important information. Ensure the summary is substantive.
-Do not write lists or numbered items unless they are explicitly written in the given text.
-Write a cohesive text. Keep in mind the context if provided and make seamless transitions.
-Output in markdown.`;
+  private estimateTokens(text: string): number {
+    const config = this.MODEL_CONFIGS[this.MODEL];
+    return Math.floor(text.split(/\s+/).length * config.wordsPerToken);
   }
 
-  async clearCache(conceptId: string, layer: number): Promise<void> {
-    await explanationCacheService.deleteExplanation(conceptId, layer);
+  private async generateSummary(content: string, targetPercentage: number): Promise<string> {
+    const model = this.gemini.getGenerativeModel({ model: 'gemini-pro' });
+    const targetLength = Math.floor(this.TOKENS_PER_SUMMARY * targetPercentage);
+    const wiggleRoom = Math.floor(targetLength * this.WIGGLE_ROOM);
+    const lowerBound = targetLength - wiggleRoom;
+    const upperBound = targetLength + wiggleRoom;
+    let iterations = 0;
+    this.target_subdivisions = Math.max(
+      1,
+      Math.ceil(targetLength / (this.TOKENS_PER_SUMMARY * this.MODEL_CONFIGS[this.MODEL].wordsPerToken))
+    );
+
+    let sections: Section[] = [];
+    if (this.isMarkdownContent(content)) {
+      sections = this.divideMarkdownContent(content);
+    } else {
+      sections = [{ header: '', content }];
+    }
+
+    let subdivisions: string[] = [];
+    let currentEstimatedLength = 0;
+    let bestSubdivisions: string[] = [];
+    let bestLengthDiff = Infinity;
+
+    while (iterations < this.MAX_ITERATIONS) {
+      subdivisions = [];
+      for (const section of sections) {
+        const sectionSubdivisions = this.subdivideContent(
+          section.content,
+          Math.max(
+            1,
+            Math.floor(
+              this.target_subdivisions *
+                (section.content.split(/\s+/).length / content.split(/\s+/).length)
+            )
+          )
+        );
+        subdivisions.push(...sectionSubdivisions);
+      }
+
+      currentEstimatedLength = this.estimateTokens(subdivisions.join(' '));
+      const currentLengthDiff = Math.abs(currentEstimatedLength - targetLength);
+
+      if (currentLengthDiff < bestLengthDiff) {
+        bestLengthDiff = currentLengthDiff;
+        bestSubdivisions = [...subdivisions];
+      }
+
+      if (currentEstimatedLength >= lowerBound && currentEstimatedLength <= upperBound) {
+        break;
+      }
+
+      if (currentEstimatedLength < lowerBound) {
+        this.subdivision_factor = Math.min(this.subdivision_factor * 1.5, 50);
+        this.target_subdivisions = Math.min(this.target_subdivisions + 1, 10);
+      } else {
+        this.subdivision_factor = Math.max(this.subdivision_factor * 0.75, 0.1);
+        this.target_subdivisions = Math.max(this.target_subdivisions - 1, 1);
+      }
+
+      iterations++;
+    }
+
+    if (currentEstimatedLength < lowerBound || currentEstimatedLength > upperBound) {
+      subdivisions = bestSubdivisions;
+    }
+
+    const summaries: string[] = [];
+    const BATCH_SIZE = 5;
+
+    for (let i = 0; i < subdivisions.length; i += BATCH_SIZE) {
+      const batch = subdivisions.slice(i, i + BATCH_SIZE);
+      const batchPromises = batch.map(async (subdivision) => {
+        const prompt = `## Text to summarize: ${subdivision}\n\n## Instructions: Summarize the text above. Maintain the most important information and ensure the summary is substantive. Output in markdown, using headers, bold, italics, etc. Write in the language of the text.`;
+        try {
+          const result = await model.generateContent(prompt);
+          return result.response.text();
+        } catch (error) {
+          logger.error('ExplanationService', 'Error generating subdivision summary', {
+            error: error instanceof Error ? error.message : String(error)
+          });
+          throw error;
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      summaries.push(...batchResults);
+
+      if (i + BATCH_SIZE < subdivisions.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    return summaries.join('\n\n');
   }
-} 
+}

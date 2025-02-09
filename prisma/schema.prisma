@@ -23,6 +23,10 @@ model User {
   learningUnits    LearningUnit[]
   progress         Progress[]
   sessions         Session[]
+  learningAnalytics LearningAnalytics[]
+  studyPatterns     StudyPattern[]
+  topicMastery      TopicMastery[]
+  assessments       Assessment[]
 }
 
 model Account {
@@ -54,36 +58,41 @@ model Session {
 }
 
 model LearningSession {
-  id           String               @id @default(cuid())
-  title        String
-  userId       String
-  progress     Float                @default(0)
-  concepts     Json[]               // Keep for backward compatibility
-  status       String               @default("active")
-  createdAt    DateTime             @default(now())
-  updatedAt    DateTime             @updatedAt
-  lastActiveAt DateTime             @default(now())
-  explanations ConceptExplanation[]
-  relations    ConceptRelation[]
-  documents    SessionDocument[]
-  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id              String               @id @default(cuid())
+  title           String
+  userId          String
+  progress        Float                @default(0)
+  concepts        Json[]
+  status          String               @default("active")
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  lastActiveAt    DateTime             @default(now())
+  explanations    ConceptExplanation[]
+  relations       ConceptRelation[]
+  user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   sessionConcepts SessionConcept[]
+  documents       SessionDocument[]
+  timeRecords     SessionTime[]        @relation("SessionTimeRecords")
+  assessments     Assessment[]
 
   @@index([userId])
   @@index([lastActiveAt])
 }
 
 model SessionDocument {
-  id                String          @id @default(cuid())
-  title             String
-  content           String
-  structuredContent Json            @default("{}")
-  index             Json
-  metadata          Json?
-  createdAt         DateTime        @default(now())
-  updatedAt         DateTime        @updatedAt
-  sessionId         String
-  session           LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  id                 String          @id @default(cuid())
+  title              String
+  content            String
+  structuredContent  Json            @default("{}")
+  index              Json
+  metadata           Json?
+  version            Int             @default(1)
+  status             String          @default("pending")
+  processingMetadata Json?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  sessionId          String
+  session            LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId])
 }
@@ -195,35 +204,158 @@ model ConceptRelation {
 }
 
 model Concept {
-  id          String         @id @default(cuid())
-  title       String
-  content     String
-  level       Int
-  order       Int
-  parentId    String?
-  parent      Concept?      @relation("ConceptHierarchy", fields: [parentId], references: [id])
-  children    Concept[]     @relation("ConceptHierarchy")
-  sessions    SessionConcept[]
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
+  id               String           @id @default(cuid())
+  title            String
+  content          String
+  level            Int
+  order            Int
+  parentId         String?
+  contentUuid      String           @unique @default(uuid())
+  version          Int              @default(1)
+  processingStatus String           @default("pending")
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  parent           Concept?         @relation("ConceptHierarchy", fields: [parentId], references: [id])
+  children         Concept[]        @relation("ConceptHierarchy")
+  sessions         SessionConcept[]
 
+  @@unique([title, level, order])
   @@index([parentId])
+  @@index([contentUuid])
 }
 
 model SessionConcept {
-  id          String          @id @default(cuid())
-  sessionId   String
-  conceptId   String
-  progress    Float           @default(0)
-  status      String          @default("not_started")
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
-  session     LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  concept     Concept         @relation(fields: [conceptId], references: [id], onDelete: Cascade)
+  id        String          @id @default(cuid())
+  sessionId String
+  conceptId String
+  progress  Float           @default(0)
+  status    String          @default("not_started")
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  concept   Concept         @relation(fields: [conceptId], references: [id], onDelete: Cascade)
+  session   LearningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@unique([sessionId, conceptId])
   @@index([sessionId])
   @@index([conceptId])
+}
+
+model SessionTime {
+  id        String          @id @default(cuid())
+  sessionId String
+  startTime DateTime        @default(now())
+  endTime   DateTime?
+  duration  Int?            @default(0)
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  session   LearningSession @relation("SessionTimeRecords", fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([startTime])
+  @@index([isActive])
+}
+
+model LearningAnalytics {
+  id            String    @id @default(cuid())
+  userId        String
+  date          DateTime  @default(now())
+  timeOfDay     Int       // Hour of day (0-23)
+  sessionLength Int       // Duration in minutes
+  completedUnits Int
+  retentionScore Float?   // Based on review performance (0-100)
+  focusScore    Float?    // Based on time spent actively learning (0-100)
+  topicId       String?   // Optional reference to most studied topic
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([date])
+  @@index([timeOfDay])
+}
+
+model StudyPattern {
+  id            String    @id @default(cuid())
+  userId        String
+  dayOfWeek     Int       // 0-6 (Sunday-Saturday)
+  hourOfDay     Int       // 0-23
+  effectiveness Float     // 0-100 score based on completion and retention
+  frequency     Int       // Number of times studied at this time
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dayOfWeek, hourOfDay])
+  @@index([userId])
+  @@index([dayOfWeek, hourOfDay])
+}
+
+model TopicMastery {
+  id            String    @id @default(cuid())
+  userId        String
+  topic         String    // Topic or concept area
+  masteryLevel  Float     // 0-100
+  attempts      Int       @default(0)
+  successRate   Float     @default(0)
+  lastReviewed  DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, topic])
+  @@index([userId])
+  @@index([topic])
+}
+
+model Assessment {
+  id            String      @id @default(cuid())
+  sessionId     String
+  userId        String
+  startedAt     DateTime    @default(now())
+  completedAt   DateTime?
+  status        AssessmentStatus @default(IN_PROGRESS)
+  questions     AssessmentQuestion[]
+  results       AssessmentResult[]
+  session       LearningSession @relation(fields: [sessionId], references: [id])
+  user          User        @relation(fields: [userId], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([sessionId])
+  @@index([userId])
+}
+
+model AssessmentQuestion {
+  id            String      @id @default(cuid())
+  assessmentId  String
+  text          String
+  type          QuestionType
+  options       String[]    @default([])
+  correctAnswer String?
+  explanation   String?
+  assessment    Assessment  @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  result        AssessmentResult?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([assessmentId])
+}
+
+model AssessmentResult {
+  id            String      @id @default(cuid())
+  assessmentId  String
+  questionId    String      @unique
+  userAnswer    String
+  isCorrect     Boolean
+  feedback      String
+  confidenceScore Int
+  assessment    Assessment  @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  question      AssessmentQuestion    @relation(fields: [questionId], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([assessmentId])
 }
 
 enum QuestionType {
@@ -241,6 +373,12 @@ enum ProcessingStatus {
 
 enum ProgressStatus {
   NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+  NEEDS_REVIEW
+}
+
+enum AssessmentStatus {
   IN_PROGRESS
   COMPLETED
   NEEDS_REVIEW

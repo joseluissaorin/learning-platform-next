@@ -8,25 +8,43 @@ import { authOptions } from "@/lib/auth/config";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { Progress } from "@prisma/client";
+import { SessionTimeService } from "@/lib/services/session-time";
+import { AnalyticsPanel } from "@/components/dashboard/analytics-panel";
+import { RobotMascot } from "@/components/landing/robot-mascot";
+import { RobotSpeechBubble } from "@/components/landing/robot-speech-bubble";
 
 const MAX_STREAK_DAYS = 30; // Consider this a "fire" streak
 
 async function getStats(userId: string) {
+  // Get all documents and learning units
   const documents = await prisma.document.count({ where: { userId } });
   const learningUnits = await prisma.learningUnit.count({ where: { userId } });
+
+  // Get all progress records for the user
   const progress = await prisma.progress.findMany({ 
     where: { userId },
-    orderBy: { updatedAt: 'desc' },
-    take: 1
+    include: {
+      learningUnit: true
+    }
   });
-  
-  const totalUnits = await prisma.learningUnit.count({ where: { userId } });
-  const completedUnits = progress.filter((p: Progress) => p.status === "COMPLETED").length;
-  const progressPercentage = totalUnits > 0 ? Math.round((completedUnits / totalUnits) * 100) : 0;
-  const lastActivity = progress[0]?.updatedAt;
 
-  // Calculate streak - look back up to MAX_STREAK_DAYS
+  // Calculate total and completed units
+  const totalUnits = learningUnits;
+  const completedUnits = progress.filter(p => p.status === "COMPLETED").length;
+  const progressPercentage = totalUnits > 0 ? Math.round((completedUnits / totalUnits) * 100) : 0;
+
+  // Get last activity
+  const lastActivity = progress.length > 0 
+    ? progress.reduce((latest, curr) => 
+        curr.updatedAt > latest ? curr.updatedAt : latest, 
+        progress[0].updatedAt
+      )
+    : null;
+
+  // Calculate streak with timezone consideration
   const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
   const lastMonthProgress = await prisma.progress.findMany({
     where: {
       userId,
@@ -39,27 +57,30 @@ async function getStats(userId: string) {
     }
   });
 
-  // Group progress by day
+  // Group progress by day considering user's timezone
   const dailyProgress = lastMonthProgress.reduce((acc: Record<string, boolean>, curr: Progress) => {
-    const date = curr.updatedAt.toISOString().split('T')[0];
-    acc[date] = true;
+    const date = new Date(curr.updatedAt);
+    date.setHours(0, 0, 0, 0);
+    const dateKey = date.toISOString().split('T')[0];
+    acc[dateKey] = true;
     return acc;
   }, {});
 
   // Calculate streak
   let streak = 0;
   for (let i = 0; i < MAX_STREAK_DAYS; i++) {
-    const date = new Date(today.getTime() - i * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .split('T')[0];
-    if (dailyProgress[date]) {
+    const date = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+    date.setHours(0, 0, 0, 0);
+    const dateKey = date.toISOString().split('T')[0];
+    
+    if (dailyProgress[dateKey]) {
       streak++;
     } else if (i === 0) {
       // Check if there was activity yesterday
-      const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000)
-        .toISOString()
-        .split('T')[0];
-      if (dailyProgress[yesterday]) {
+      const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+      yesterday.setHours(0, 0, 0, 0);
+      const yesterdayKey = yesterday.toISOString().split('T')[0];
+      if (dailyProgress[yesterdayKey]) {
         streak = 1;
       }
       break;
@@ -67,8 +88,19 @@ async function getStats(userId: string) {
       break;
     }
   }
+
+  // Get total time spent using SessionTimeService
+  const totalSeconds = await SessionTimeService.getUserTotalTime(userId);
+  const timeSpentFormatted = SessionTimeService.formatDuration(totalSeconds);
   
-  return { documents, learningUnits, progressPercentage, streak, lastActivity };
+  return { 
+    documents, 
+    learningUnits, 
+    progressPercentage, 
+    streak, 
+    lastActivity,
+    timeSpentFormatted 
+  };
 }
 
 function getTimeAgo(date: Date | null | undefined) {
@@ -101,12 +133,30 @@ export default async function DashboardPage() {
     <DashboardLayout>
       <div className="space-y-8">
         {/* Welcome Section */}
-        <div>
-          <h1 className="text-4xl font-bold tracking-tight">Welcome back{session.user.name ? `, ${session.user.name.split(" ")[0]}` : ""}!</h1>
-          <p className="mt-2 text-base-content/70 text-lg">
-            Track your learning progress and manage your documents.
-          </p>
-        </div>
+        <Card className="transition-all duration-200 ease-out hover:shadow-md">
+          <CardContent className="p-6">
+            <div className="flex items-center gap-6">
+              <div className="relative">
+                <RobotMascot 
+                  size="lg" 
+                  expression={isFireStreak ? "excited" : "happy"} 
+                  className="w-24 h-24" 
+                />
+                <RobotSpeechBubble 
+                  message={isFireStreak ? "Wow! Your streak is on fire! 🔥" : "Ready to learn something new today? 📚"} 
+                  position="right"
+                  className="z-10"
+                />
+              </div>
+              <div>
+                <h2 className="text-4xl font-bold tracking-tight">Welcome back, {session.user.name?.split(" ")[0]}!</h2>
+                <p className="mt-2 text-base-content/70 text-lg">
+                  Ready to continue your learning journey?
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
 
         {/* Stats Grid */}
         <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
@@ -151,7 +201,7 @@ export default async function DashboardPage() {
                 </div>
                 <div>
                   <p className="text-sm font-medium text-muted-foreground transition-colors duration-300 ease-in-out group-hover:text-primary/70">Time Spent</p>
-                  <h3 className="text-2xl font-bold transition-all duration-300 ease-in-out group-hover:text-primary animate-in fade-in-0 zoom-in-95">2.5h</h3>
+                  <h3 className="text-2xl font-bold transition-all duration-300 ease-in-out group-hover:text-primary animate-in fade-in-0 zoom-in-95">{stats.timeSpentFormatted}</h3>
                 </div>
               </div>
             </CardContent>
@@ -200,6 +250,9 @@ export default async function DashboardPage() {
             </CardContent>
           </Card>
         </div>
+
+        {/* Analytics Section */}
+        <AnalyticsPanel userId={session.user.id} />
 
         {/* Quick Actions */}
         <div className="grid gap-6 md:grid-cols-2">

@@ -10,7 +10,8 @@ export function middleware(request: NextRequest) {
     request.nextUrl.pathname.startsWith("/api/analyze") ||
     request.nextUrl.pathname.startsWith("/api/analysis") ||
     request.nextUrl.pathname.startsWith("/api/sessions") ||
-    request.nextUrl.pathname.startsWith("/api/concepts")
+    request.nextUrl.pathname.startsWith("/api/concepts") ||
+    request.nextUrl.pathname.startsWith("/api/explanations")
   ) {
     return NextResponse.next();
   }

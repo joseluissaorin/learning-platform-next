@@ -1,11 +1,15 @@
-import Redis from 'ioredis';
+import type Redis from 'ioredis';
 
 let redis: Redis | null = null;
 
-// This ensures Redis client is only created on the server side
-if (typeof window === 'undefined') {
+export async function getRedisClient(): Promise<Redis> {
+  if (typeof window !== 'undefined') {
+    throw new Error('Redis client cannot be used on the client side');
+  }
+
   if (!redis) {
-    redis = new Redis({
+    const { default: RedisClient } = await import('ioredis');
+    redis = new RedisClient({
       host: process.env.REDIS_HOST || 'localhost',
       port: parseInt(process.env.REDIS_PORT || '6379'),
       password: process.env.REDIS_PASSWORD,
@@ -23,11 +27,6 @@ if (typeof window === 'undefined') {
       console.log('[Redis] Connected successfully');
     });
   }
-}
 
-export function getRedisClient(): Redis {
-  if (!redis) {
-    throw new Error('Redis client not initialized - are you trying to use it on the client side?');
-  }
   return redis;
 } 

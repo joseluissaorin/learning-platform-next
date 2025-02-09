@@ -115,110 +115,214 @@ export async function POST(request: NextRequest) {
     log('Transforming sections into concepts');
     const concepts = await structuredDocService.transformSectionsIntoConcepts(transformedIndex.sections || []);
 
+    // Validate concept structure
+    if (!Array.isArray(concepts) || concepts.length === 0) {
+      log('Error: Invalid concept array structure');
+      return NextResponse.json(
+        { error: "Invalid concept structure: Empty or invalid array" },
+        { status: 400 }
+      );
+    }
+
+    // Validate each concept
+    for (const concept of concepts) {
+      if (!concept.title || typeof concept.level !== 'number' || typeof concept.order !== 'number') {
+        log('Error: Invalid concept structure %O', concept);
+        return NextResponse.json(
+          { error: `Invalid concept structure: Missing required fields for concept "${concept.title || 'unknown'}"` },
+          { status: 400 }
+        );
+      }
+
+      // Validate parent-child relationships
+      if (concept.parentId) {
+        const parentExists = concepts.some(c => c.id === concept.parentId);
+        if (!parentExists) {
+          log('Error: Invalid parent reference %O', {
+            conceptTitle: concept.title,
+            parentId: concept.parentId
+          });
+          return NextResponse.json(
+            { error: `Invalid concept structure: Parent concept not found for "${concept.title}"` },
+            { status: 400 }
+          );
+        }
+      }
+    }
+
     log('Document generated successfully %O', {
       contentLength: structuredContent.length,
-      conceptCount: concepts.length
+      conceptCount: concepts.length,
+      concepts: concepts.map(c => ({
+        id: c.id,
+        title: c.title,
+        level: c.level,
+        order: c.order,
+        parentId: c.parentId
+      }))
     });
 
-    // Create a new learning session using raw SQL
-    log('Creating learning session');
-    const learningSession = await prisma.$queryRaw<LearningSessionResult[]>`
-      INSERT INTO "LearningSession" (
-        "id",
-        "title",
-        "userId",
-        "concepts",
-        "status",
-        "createdAt",
-        "updatedAt",
-        "lastActiveAt",
-        "progress"
-      )
-      VALUES (
-        gen_random_uuid(), 
-        ${title}, 
-        ${session.user.id}, 
-        ${JSON.stringify(concepts)}::jsonb[], 
-        'active',
-        NOW(),
-        NOW(),
-        NOW(),
-        0
-      )
-      RETURNING *;
-    `;
+    // Create a new learning session and its concepts using a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      log('Starting transaction for session and concept creation');
+      
+      try {
+        // 1. Create the learning session
+        log('Creating learning session with title: %s', title);
+        const learningSession = await tx.learningSession.create({
+          data: {
+            title,
+            userId: session.user.id,
+            concepts: [],
+            status: 'active',
+            progress: 0
+          }
+        });
 
-    if (!learningSession?.[0]?.id) {
-      logError('Failed to create learning session %O', learningSession);
-      return new NextResponse('Failed to create learning session', { status: 500 });
-    }
+        if (!learningSession?.id) {
+          throw new Error('Failed to create learning session: No ID returned');
+        }
 
-    const sessionId = learningSession[0].id;
-    log('Learning session created %s', sessionId);
+        const sessionId = learningSession.id;
+        log('Created learning session with ID: %s', sessionId);
 
-    // Add sessionId to the transformed index
-    transformedIndex.sessionId = sessionId;
+        // 2. Create concepts and their relationships
+        log('Starting concept creation, total concepts: %d', concepts.length);
+        
+        // First, create a map to store concept IDs
+        const conceptIdMap = new Map<string, string>();
+        
+        // Sort concepts by level to ensure parents are created before children
+        const sortedConcepts = [...concepts].sort((a, b) => a.level - b.level);
+        
+        // Batch concept creation for better performance
+        const batchSize = 50;
+        for (let i = 0; i < sortedConcepts.length; i += batchSize) {
+          const batch = sortedConcepts.slice(i, i + batchSize);
+          log('Processing concept batch %d-%d of %d', i, i + batch.length, sortedConcepts.length);
 
-    // Create the session document using raw SQL
-    log('Creating session document');
-    const sessionDocument = await prisma.$queryRaw<SessionDocumentResult[]>`
-      INSERT INTO "SessionDocument" (
-        "id",
-        "title",
-        "content",
-        "structuredContent",
-        "concepts",
-        "index",
-        "metadata",
-        "sessionId",
-        "createdAt",
-        "updatedAt"
-      )
-      VALUES (
-        gen_random_uuid(),
-        ${title},
-        ${content},
-        ${JSON.stringify(structuredContent)}::jsonb,
-        ${JSON.stringify(concepts)}::jsonb,
-        ${JSON.stringify(transformedIndex)}::jsonb,
-        ${JSON.stringify({ language })}::jsonb,
-        ${sessionId},
-        NOW(),
-        NOW()
-      )
-      RETURNING *;
-    `;
+          await Promise.all(batch.map(async (concept) => {
+            // Create or update the concept
+            const dbConcept = await tx.concept.upsert({
+              where: {
+                title_level_order: {
+                  title: concept.title,
+                  level: concept.level || 0,
+                  order: concept.order || 0
+                }
+              },
+              create: {
+                title: concept.title,
+                content: concept.content || '',
+                level: concept.level || 0,
+                order: concept.order || 0,
+                parentId: concept.parentId ? conceptIdMap.get(concept.parentId) : null
+              },
+              update: {
+                content: concept.content || '',
+                parentId: concept.parentId ? conceptIdMap.get(concept.parentId) : null
+              }
+            });
 
-    if (!sessionDocument?.[0]?.id) {
-      logError('Failed to create session document %O', sessionDocument);
-      return new NextResponse('Failed to create session document', { status: 500 });
-    }
+            // Store the concept's database ID in the map
+            conceptIdMap.set(concept.id, dbConcept.id);
+            log('Created/Updated concept with ID: %s', dbConcept.id);
 
-    log('Session document created %s', sessionDocument[0].id);
+            // Create session-concept relationship
+            await tx.sessionConcept.upsert({
+              where: {
+                sessionId_conceptId: {
+                  sessionId,
+                  conceptId: dbConcept.id
+                }
+              },
+              create: {
+                sessionId,
+                conceptId: dbConcept.id,
+                progress: 0,
+                status: 'not_started'
+              },
+              update: {}
+            });
+
+            log('Created session-concept relationship for concept: %s', concept.title);
+          }));
+        }
+
+        // 3. Create the session document
+        log('Creating session document');
+        
+        // Safely stringify JSON data
+        const safeStructuredContent = structuredContent ? JSON.stringify(structuredContent) : '{}';
+        const safeIndex = transformedIndex ? JSON.stringify(transformedIndex) : '{"sections":[]}';
+        const safeMetadata = { language };
+
+        log('Prepared JSON data for session document: %O', {
+          structuredContentLength: safeStructuredContent.length,
+          indexSections: transformedIndex?.sections?.length || 0,
+          metadata: safeMetadata
+        });
+
+        const sessionDocument = await tx.sessionDocument.create({
+          data: {
+            title,
+            content,
+            structuredContent: safeStructuredContent as any,
+            index: safeIndex as any,
+            metadata: safeMetadata as any,
+            sessionId
+          }
+        });
+
+        if (!sessionDocument?.id) {
+          throw new Error('Failed to create session document: No ID returned');
+        }
+
+        log('Created session document with ID: %s', sessionDocument.id);
+
+        return {
+          sessionId,
+          documentId: sessionDocument.id
+        };
+      } catch (txError) {
+        log('Transaction failed: %O', {
+          error: txError instanceof Error ? txError.message : 'Unknown error',
+          step: 'transaction execution'
+        });
+        throw txError;
+      }
+    }, {
+      timeout: 30000, // Increase timeout to 30 seconds
+      maxWait: 35000  // Maximum time to wait for transaction to start
+    });
 
     return NextResponse.json({
       success: true,
-      data: {
-        sessionId,
-        documentId: sessionDocument[0].id
-      }
+      data: result
     });
   } catch (err) {
-    // Safely format error for logging
+    // Safely extract error details without source map dependencies
     const errorDetails = {
-      message: err instanceof Error ? err.message : String(err),
-      name: err instanceof Error ? err.name : 'UnknownError',
-      code: (err as any)?.code,
-      stack: err instanceof Error ? err.stack : undefined
+      message: err instanceof Error ? err.message : 'An unknown error occurred',
+      type: err instanceof Error ? err.constructor.name : typeof err,
+      data: err instanceof Error ? undefined : err
     };
-    
-    logError('Error creating session document: %j', errorDetails);
-    
-    return new NextResponse(
-      JSON.stringify({
-        error: errorDetails.message
-      }), 
-      { status: 500 }
-    );
+
+    // Log the error without source map information
+    logError('Session document creation failed: %j', {
+      error: errorDetails.message,
+      type: errorDetails.type
+    });
+
+    // Return a clean error response
+    return NextResponse.json({
+      error: errorDetails.message,
+      type: errorDetails.type
+    }, { 
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
   }
 } 
